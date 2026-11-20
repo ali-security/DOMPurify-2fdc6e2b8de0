@@ -5307,6 +5307,118 @@
       }
     );
 
+    // -------------------------------------------------------------------
+    // The hooks registry is a plain object, so an unknown entry point such
+    // as '__proto__' used to resolve off the prototype chain and arrayPush
+    // then wrote to Object.prototype. (CVE-2026-65898)
+    // -------------------------------------------------------------------
+
+    QUnit.test(
+      'addHook ignores unknown entry points and does not pollute Object.prototype',
+      function (assert) {
+        var hookFunction = function () {};
+
+        try {
+          DOMPurify.addHook('__proto__', hookFunction);
+
+          assert.equal(
+            {}.length,
+            undefined,
+            'Object.prototype.length was not created'
+          );
+          assert.equal({}[0], undefined, 'Object.prototype[0] was not created');
+          assert.equal([].length, 0, 'Array.prototype was not affected');
+
+          // Unknown entry points are ignored, not thrown on.
+          DOMPurify.addHook('constructor', hookFunction);
+          DOMPurify.addHook('notAHook', hookFunction);
+          assert.equal(
+            DOMPurify.removeHook('__proto__'),
+            undefined,
+            'removeHook on an unknown entry point returns undefined'
+          );
+          DOMPurify.removeHooks('__proto__');
+          assert.equal(
+            {}.length,
+            undefined,
+            'Object.prototype still untouched after removeHook(s)'
+          );
+
+          // Real hooks keep working.
+          DOMPurify.addHook('afterSanitizeAttributes', function (node) {
+            if (node.setAttribute) {
+              node.setAttribute('class', 'world');
+            }
+          });
+          assert.equal(
+            DOMPurify.sanitize('<div class="hello"></div>'),
+            '<div class="world"></div>',
+            'known entry points are still registered'
+          );
+        } finally {
+          DOMPurify.removeHooks('afterSanitizeAttributes');
+          delete Object.prototype[0];
+          delete Object.prototype.length;
+          delete Object[1];
+        }
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65898: removeHook / removeHooks on unknown entry points do not touch prototypes',
+      function (assert) {
+        var purify = DOMPurify(window);
+
+        try {
+          // Without the entry-point guard, removeHook('__proto__') pops from
+          // Object.prototype and writes Object.prototype.length = 0.
+          assert.equal(
+            purify.removeHook('__proto__'),
+            undefined,
+            'removeHook on __proto__ returns undefined'
+          );
+          assert.equal(
+            {}.length,
+            undefined,
+            'removeHook did not create Object.prototype.length'
+          );
+
+          // Without the guard, removeHooks('__proto__') swaps the prototype
+          // of the hooks registry for a fresh array.
+          purify.removeHooks('__proto__');
+          purify.removeHooks('constructor');
+          assert.equal(
+            {}.length,
+            undefined,
+            'removeHooks did not create Object.prototype.length'
+          );
+
+          // The registry still behaves: a known hook added afterwards runs,
+          // and removeHook returns it.
+          var hookFunction = function (node) {
+            if (node.setAttribute) {
+              node.setAttribute('class', 'world');
+            }
+          };
+
+          purify.addHook('afterSanitizeAttributes', hookFunction);
+          assert.equal(
+            purify.sanitize('<div class="hello"></div>'),
+            '<div class="world"></div>',
+            'known entry point still registered after unknown removals'
+          );
+          assert.equal(
+            purify.removeHook('afterSanitizeAttributes'),
+            hookFunction,
+            'removeHook on a known entry point returns the hook'
+          );
+        } finally {
+          purify.removeAllHooks();
+          delete Object.prototype.length;
+        }
+      }
+    );
+
     QUnit.test('removeHook returns hook function', function (assert) {
       const entryPoint = 'afterSanitizeAttributes';
       const dirty = '<div class="hello"></div>';
@@ -5324,6 +5436,9 @@
       // set the same hook
       DOMPurify.addHook(entryPoint, hookFunction);
       assert.equal(DOMPurify.sanitize(dirty), expected);
+
+      // Teardown
+      DOMPurify.removeHooks(entryPoint);
     });
   };
 });

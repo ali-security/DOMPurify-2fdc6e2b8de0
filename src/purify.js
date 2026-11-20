@@ -24,6 +24,42 @@ import {
 
 const getGlobal = () => (typeof window === 'undefined' ? null : window);
 
+/* Known hook entry points. The `hooks` object is populated on demand, so a
+ * plain own-property check against it would reject every legitimate
+ * first-time `addHook()` call. The entry point is therefore validated
+ * against this fixed set of names instead, which also keeps a non-hook key
+ * (e.g. `__proto__`) from resolving off the prototype chain and letting
+ * `arrayPush` write to `Object.prototype`. The set is created with a null
+ * prototype by `addToSet`, so the lookup itself is prototype-safe. */
+const HOOK_ENTRY_POINTS = freeze(
+  addToSet(
+    {},
+    [
+      'beforeSanitizeElements',
+      'uponSanitizeElement',
+      'afterSanitizeElements',
+      'beforeSanitizeAttributes',
+      'uponSanitizeAttribute',
+      'afterSanitizeAttributes',
+      'beforeSanitizeShadowDOM',
+      'uponSanitizeShadowNode',
+      'afterSanitizeShadowDOM',
+    ],
+    stringToString
+  )
+);
+
+/**
+ * _isValidHookEntryPoint
+ * Checks that a caller-supplied hook entry point is one of the known hooks.
+ *
+ * @param  {String} entryPoint entry point to validate
+ * @return {Boolean} true if the entry point is a known hook
+ */
+const _isValidHookEntryPoint = function (entryPoint) {
+  return HOOK_ENTRY_POINTS[entryPoint] === true;
+};
+
 /**
  * Creates a no-op policy for internal use only.
  * Don't export this function outside this module!
@@ -2293,6 +2329,14 @@ function createDOMPurify(window = getGlobal()) {
       return;
     }
 
+    /* Reject unknown entry points. Without this, a non-hook key (e.g.
+     * '__proto__') indexes off the prototype chain rather than a real
+     * hook array, and arrayPush then writes to Object.prototype. Guard
+     * by matching against the known hook names. */
+    if (!_isValidHookEntryPoint(entryPoint)) {
+      return;
+    }
+
     hooks[entryPoint] = hooks[entryPoint] || [];
     arrayPush(hooks[entryPoint], hookFunction);
   };
@@ -2306,6 +2350,10 @@ function createDOMPurify(window = getGlobal()) {
    * @return {Function} removed(popped) hook
    */
   DOMPurify.removeHook = function (entryPoint) {
+    if (!_isValidHookEntryPoint(entryPoint)) {
+      return undefined;
+    }
+
     if (hooks[entryPoint]) {
       return arrayPop(hooks[entryPoint]);
     }
@@ -2318,6 +2366,10 @@ function createDOMPurify(window = getGlobal()) {
    * @param  {String} entryPoint entry point for the hooks to remove
    */
   DOMPurify.removeHooks = function (entryPoint) {
+    if (!_isValidHookEntryPoint(entryPoint)) {
+      return;
+    }
+
     if (hooks[entryPoint]) {
       hooks[entryPoint] = [];
     }
