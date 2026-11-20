@@ -1195,6 +1195,15 @@ function createDOMPurify(window = getGlobal()) {
       return true;
     }
 
+    /* Where the cached getter is available its verdict is final: it rejects
+       every value that is no DOM node of any realm. Duck-typing past it
+       would accept a plain object carrying nodeType and nodeName, which is
+       then handed to importNode() instead of being stringified.
+       GHSA-4w3q-35jp-p934. */
+    if (getNodeType) {
+      return false;
+    }
+
     return typeof Node === 'object'
       ? object instanceof Node
       : object &&
@@ -2100,9 +2109,12 @@ function createDOMPurify(window = getGlobal()) {
       /* Sanitize attached shadow roots before the main iterator runs.
          The iterator does not descend into shadow trees. CVE-2026-49978 */
       _sanitizeAttachedShadowRoots(dirty);
-    } else if (dirty instanceof Node) {
+    } else if (_isNode(dirty)) {
       /* If dirty is a DOM element, append to an empty document to avoid
-         elements being stripped by the parser */
+         elements being stripped by the parser. `dirty instanceof Node` is
+         realm-bound: a node of another window (e.g. a same-origin iframe
+         document) failed it and fell through to the string branch below.
+         _isNode recognizes nodes of any realm. GHSA-4w3q-35jp-p934 */
       body = _initDocument('<!---->');
       importedNode = body.ownerDocument.importNode(dirty, true);
       if (importedNode.nodeType === 1 && importedNode.nodeName === 'BODY') {

@@ -5482,6 +5482,252 @@
       }
     );
 
+    // -----------------------------------------------------------------------
+    // CVE-2026-65904 (GHSA-4w3q-35jp-p934) - the node-input dispatch in
+    // sanitize() still used the realm-bound `dirty instanceof Node`. A node
+    // of another window passed without IN_PLACE fell through to the string
+    // branch, where it threw or was serialized as "[object ...]" instead of
+    // being sanitized. Spoofed plain objects carrying nodeType / nodeName
+    // must not be treated as nodes either.
+    // -----------------------------------------------------------------------
+
+    QUnit.test(
+      'CVE-2026-65904: IN_PLACE sanitizes cross-realm DOM nodes (GHSA-4w3q-35jp-p934)',
+      function (assert) {
+        withForeignDocument(assert, function (foreignDocument) {
+          var dirty = foreignDocument.createElement('div');
+          dirty.innerHTML =
+            '<img src=x onerror=alert(1)><script>alert(2)<\/script>';
+
+          var result = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+
+          assert.strictEqual(
+            result,
+            dirty,
+            'returns the same node, not a string'
+          );
+          assert.notOk(dirty.querySelector('script'), 'script removed');
+          assert.notOk(
+            dirty.querySelector('img').getAttribute('onerror'),
+            'onerror removed'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65904: string-input path still stringifies non-node objects (GHSA-4w3q-35jp-p934)',
+      function (assert) {
+        assert.strictEqual(
+          DOMPurify.sanitize({
+            toString: function () {
+              return '<b>hi</b><script>x<\/script>';
+            },
+          }),
+          '<b>hi</b>'
+        );
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65904: plain objects with nodeType are not treated as nodes (GHSA-4w3q-35jp-p934)',
+      function (assert) {
+        // Regression guard: duck-typing must not accept spoofed objects.
+        var fake = { nodeType: 1, nodeName: 'DIV', ownerDocument: {} };
+        // Should be stringified, not iterated. No throw, returns sanitized string.
+        var result = DOMPurify.sanitize(fake);
+        assert.strictEqual(typeof result, 'string');
+
+        // A spoofed object asking for IN_PLACE is stringified too, which
+        // switches IN_PLACE off.
+        var fakeWithMarkup = {
+          nodeType: 1,
+          nodeName: 'DIV',
+          toString: function () {
+            return '<img src=x onerror=alert(1)>';
+          },
+        };
+        assert.strictEqual(
+          DOMPurify.sanitize(fakeWithMarkup, { IN_PLACE: true }),
+          '<img src="x">',
+          'spoofed object is stringified and sanitized'
+        );
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65904: cross-realm DOM input across config variants (GHSA-4w3q-35jp-p934)',
+      function (assert) {
+        withForeignDocument(assert, function (foreignDocument) {
+          // A cross-realm node identical to the PoC: an HTMLDivElement owned
+          // by an iframe document, containing a known XSS payload.
+          var PAYLOAD =
+            '<p>hi <b>x</b></p>' +
+            '<img src=x onerror=alert(1)>' +
+            '<script>alert(2)<\/script>';
+
+          var mk = function () {
+            var n = foreignDocument.createElement('div');
+            n.innerHTML = PAYLOAD;
+            return n;
+          };
+
+          // Serialize whatever sanitize returns into a string we can grep.
+          var ser = function (r) {
+            if (r === undefined || r === null) {
+              return String(r);
+            }
+
+            if (typeof r === 'string') {
+              return r;
+            }
+
+            if (r.outerHTML !== undefined) {
+              return r.outerHTML;
+            }
+
+            if (r.nodeType === 11) {
+              // DocumentFragment
+              var w = document.createElement('div');
+              w.appendChild(r.cloneNode(true));
+              return w.innerHTML;
+            }
+
+            return String(r);
+          };
+
+          // The universal invariant across every config variant: no
+          // executable payload may appear in the returned value.
+          var assertNoExecutable = function (label, returned) {
+            var s = ser(returned);
+            assert.notOk(/<script/i.test(s), label + ': no <script> in return');
+            assert.notOk(/onerror=/i.test(s), label + ': no onerror= in return');
+          };
+
+          // c1: sanitize(node, {}). With the dispatch still keyed on
+          // `dirty instanceof Node`, the cross-realm node fell through to the
+          // string branch and threw on `dirty.indexOf`. It must now be
+          // sanitized like a node of this realm.
+          var n1 = mk();
+          var returned1;
+          var threw1;
+          try {
+            returned1 = DOMPurify.sanitize(n1, {});
+          } catch (error) {
+            threw1 = error;
+          }
+
+          assert.notOk(threw1, 'c1: cross-realm node input does not throw');
+          assert.strictEqual(
+            returned1,
+            '<div><p>hi <b>x</b></p><img src="x"></div>',
+            'c1: cross-realm node is sanitized and serialized'
+          );
+          assertNoExecutable('c1', returned1);
+          assert.notOk(
+            /\[object /.test(ser(returned1)),
+            'c1: no stringified-node placeholder (dispatch must not go ' +
+              'through the string branch)'
+          );
+
+          // c2: sanitize(node, { IN_PLACE: true }). The original
+          // GHSA-4w3q-35jp-p934 case: the node is mutated in place and
+          // returned.
+          var n2 = mk();
+          var returned2 = DOMPurify.sanitize(n2, { IN_PLACE: true });
+          assert.strictEqual(
+            returned2,
+            n2,
+            'c2: returns the same node, not a string'
+          );
+          assert.notOk(
+            n2.querySelector('script'),
+            'c2: <script> removed in place'
+          );
+          var img = n2.querySelector('img');
+          assert.ok(img, 'c2: <img> retained');
+          assert.notOk(
+            img.hasAttribute('onerror'),
+            'c2: onerror stripped in place'
+          );
+          assertNoExecutable('c2', n2);
+
+          // c3: sanitize(node, { RETURN_DOM: true })
+          var n3 = mk();
+          var returned3 = DOMPurify.sanitize(n3, { RETURN_DOM: true });
+          assertNoExecutable('c3', returned3);
+          assert.strictEqual(
+            returned3.innerHTML,
+            '<div><p>hi <b>x</b></p><img src="x"></div>',
+            'c3: the returned DOM holds the sanitized cross-realm node'
+          );
+          // Original node is non-IN_PLACE and must not have been mutated.
+          assert.ok(
+            /onerror=/i.test(n3.outerHTML),
+            'c3: original cross-realm node is left untouched (non-IN_PLACE contract)'
+          );
+
+          // c4: sanitize(node, { RETURN_DOM_FRAGMENT: true })
+          var n4 = mk();
+          var returned4 = DOMPurify.sanitize(n4, {
+            RETURN_DOM_FRAGMENT: true,
+          });
+          assertNoExecutable('c4', returned4);
+          assert.strictEqual(
+            ser(returned4),
+            '<div><p>hi <b>x</b></p><img src="x"></div>',
+            'c4: the returned fragment holds the sanitized cross-realm node'
+          );
+          assert.ok(
+            /onerror=/i.test(n4.outerHTML),
+            'c4: original cross-realm node is left untouched (non-IN_PLACE contract)'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65904: node input of a foreign realm is sanitized without IN_PLACE (GHSA-4w3q-35jp-p934)',
+      function (assert) {
+        // The same realm mismatch, reproduced in every engine: this
+        // instance's Node constructor is not on the prototype chain of the
+        // document's nodes, so `dirty instanceof Node` is false for them.
+        var realmPurify = createForeignRealmPurify();
+
+        // Built in an inert document: the input node is not sanitized in
+        // place, so a live <img onerror> would fire after the test.
+        var inertDocument = document.implementation.createHTMLDocument('');
+        var mk = function () {
+          var root = inertDocument.createElement('div');
+          root.innerHTML =
+            '<p>hi</p><img src="x" onerror="alert(1)"><script>alert(2)</script>';
+          return root;
+        };
+
+        var clean;
+        var threw;
+        try {
+          clean = realmPurify.sanitize(mk());
+        } catch (error) {
+          threw = error;
+        }
+
+        assert.notOk(threw, 'foreign-realm node input does not throw');
+        assert.strictEqual(
+          clean,
+          '<div><p>hi</p><img src="x"></div>',
+          'foreign-realm node input is sanitized as a node'
+        );
+
+        var dom = realmPurify.sanitize(mk(), { RETURN_DOM: true });
+        assert.strictEqual(
+          dom.innerHTML,
+          '<div><p>hi</p><img src="x"></div>',
+          'RETURN_DOM holds the sanitized node, not a "[object ...]" text'
+        );
+      }
+    );
+
     QUnit.test('removeHook returns hook function', function (assert) {
       const entryPoint = 'afterSanitizeAttributes';
       const dirty = '<div class="hello"></div>';
