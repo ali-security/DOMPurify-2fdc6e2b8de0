@@ -434,6 +434,69 @@
         ' '
       );
     });
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES template literal scrub does not mutate markup',
+      function (assert) {
+        // CVE-2025-26791: TMPLIT_EXPR used to require a closing '}', so a lone
+        // '${' survived the per-node scrubs and the final scrub of the
+        // serialized string removed everything from it up to the last '}' of
+        // the markup, tags and attribute quotes included. Parsing the result
+        // again could turn inert attribute text into live attributes (mXSS).
+        var countHandlers = function (html) {
+          var doc = document.implementation.createHTMLDocument('');
+          doc.body.innerHTML = html;
+          return doc.body.querySelectorAll('[onerror]').length;
+        };
+
+        // '${' in an attribute and '}' in the following text: dropping the
+        // closing quote turns the alt text of the next img into attributes
+        var clean = DOMPurify.sanitize(
+          '<img src=x title="${">}<img alt="src=x onerror=alert(1) x="><b title="z"></b>',
+          { SAFE_FOR_TEMPLATES: true }
+        );
+        assert.equal(countHandlers(clean), 0, 'attribute quote shift: ' + clean);
+        assert.notOk(/\$\{/.test(clean), 'no template literal left: ' + clean);
+
+        // '${' in text and '}' inside a later attribute value
+        clean = DOMPurify.sanitize(
+          '<b>${</b><a title="}<img src=x onerror=alert(1)>"></a>',
+          { SAFE_FOR_TEMPLATES: true }
+        );
+        assert.equal(countHandlers(clean), 0, 'attribute text exposed: ' + clean);
+        assert.notOk(/\$\{/.test(clean), 'no template literal left: ' + clean);
+
+        // Published PoC: '${' inside <style> and '}' after it
+        clean = DOMPurify.sanitize(
+          '<math><foo-test><mi><li><table><foo-test><li></li></foo-test>a\n' +
+            '<style>\n<! ${\n</style>\n}\n' +
+            '<foo-b id="><img src onerror=\'alert(1)\'>">hmm...</foo-b>\n' +
+            '</table></li></mi></foo-test></math>',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            CUSTOM_ELEMENT_HANDLING: { tagNameCheck: /^foo-/ },
+          }
+        );
+        assert.equal(countHandlers(clean), 0, 'style PoC: ' + clean);
+        assert.notOk(/\$\{/.test(clean), 'no template literal left: ' + clean);
+
+        // A lone '${' is scrubbed from text and attribute values
+        assert.equal(
+          DOMPurify.sanitize('a${b', { SAFE_FOR_TEMPLATES: true }),
+          'a '
+        );
+        assert.equal(
+          DOMPurify.sanitize('<a title="${x">${y</a>', {
+            SAFE_FOR_TEMPLATES: true,
+          }),
+          '<a title=" "> </a>'
+        );
+        // Complete template literals are still scrubbed
+        assert.equal(
+          DOMPurify.sanitize('<b>${alert(1)}</b>', { SAFE_FOR_TEMPLATES: true }),
+          '<b> </b>'
+        );
+      }
+    );
     QUnit.test('Config-Flag tests: SANITIZE_DOM', function (assert) {
       // SANITIZE_DOM
       assert.equal(
