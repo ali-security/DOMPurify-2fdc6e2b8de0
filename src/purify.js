@@ -278,6 +278,15 @@ function createDOMPurify(window = getGlobal()) {
   /* Track whether config is already set on this instance of DOMPurify. */
   let SET_CONFIG = false;
 
+  /* Pristine allowlist bindings captured by the last _parseConfig() run,
+   * before any per-walk hook clone. sanitize() restores ALLOWED_TAGS /
+   * ALLOWED_ATTR from these before the walk, so a hook's in-call widening
+   * cannot carry across calls - neither on the persistent setConfig() path,
+   * where _parseConfig is skipped, nor when _parseConfig returns early for
+   * an already parsed config object. Reset by clearConfig(). */
+  let PRISTINE_ALLOWED_TAGS = null;
+  let PRISTINE_ALLOWED_ATTR = null;
+
   /* Decide if all elements (e.g. style, script) must be children of
    * document.body. By default, browsers might move them to document.head */
   let FORCE_BODY = false;
@@ -616,6 +625,12 @@ function createDOMPurify(window = getGlobal()) {
       addToSet(ALLOWED_TAGS, ['tbody']);
       delete FORBID_TAGS.tbody;
     }
+
+    /* Remember the allowlists this config resolved to. They may be the
+     * module-level DEFAULT_ALLOWED_TAGS / DEFAULT_ALLOWED_ATTR, which must
+     * never be handed to an uponSanitize* hook by reference (see sanitize). */
+    PRISTINE_ALLOWED_TAGS = ALLOWED_TAGS;
+    PRISTINE_ALLOWED_ATTR = ALLOWED_ATTR;
 
     // Prevent further manipulation of configuration.
     // Not available in IE8, Safari 5, etc.
@@ -1076,6 +1091,12 @@ function createDOMPurify(window = getGlobal()) {
       !elm.attributes ||
       typeof elm.attributes.getNamedItem !== 'function' ||
       typeof elm.nodeType !== 'number' ||
+      /* NodeType clobbering probe: the cached Node.prototype.nodeType getter
+         returns 1 for any element of any realm, while a direct read on a
+         clobbered form (e.g. <input name="nodeType">) returns the named
+         child. Several mXSS / PI / comment branches in _sanitizeElements
+         compare currentNode.nodeType directly. */
+      (realNodeType !== null && elm.nodeType !== realNodeType) ||
       typeof elm.removeAttribute !== 'function' ||
       typeof elm.setAttribute !== 'function' ||
       typeof elm.namespaceURI !== 'string' ||
@@ -1141,6 +1162,48 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _hasHooks
+   * Whether at least one hook is registered for an entry point, read the
+   * same way _executeHook reads it
+   *
+   * @param  {String} entryPoint  Name of the hook's entry point
+   * @return {Boolean} true if _executeHook would run a hook
+   */
+  const _hasHooks = function (entryPoint) {
+    const entryHooks = hooks[entryPoint];
+    return Boolean(entryHooks) && entryHooks.length > 0;
+  };
+
+  /**
+   * _forkSharedAllowlist
+   * Fork a hook-mutable allowlist off its shared binding right before an
+   * uponSanitize* hook sees it. The per-walk clone in sanitize() samples the
+   * hooks once, before the walk, so a hook installed later in the walk (e.g.
+   * from beforeSanitizeElements) would otherwise get the module default or
+   * the pristine config binding by reference and could widen it for good.
+   * Returns the set unchanged once it is call-local, so repeated calls are
+   * idempotent.
+   *
+   * @param  {String} entryPoint  Name of the uponSanitize* hook
+   * @param  {Object} set         Current ALLOWED_TAGS / ALLOWED_ATTR binding
+   * @param  {Object} defaultSet  DEFAULT_ALLOWED_TAGS / DEFAULT_ALLOWED_ATTR
+   * @param  {Object} pristineSet PRISTINE_ALLOWED_TAGS / PRISTINE_ALLOWED_ATTR
+   * @return {Object} a call-local clone if needed, else set
+   */
+  const _forkSharedAllowlist = function (
+    entryPoint,
+    set,
+    defaultSet,
+    pristineSet
+  ) {
+    if (!_hasHooks(entryPoint)) {
+      return set;
+    }
+
+    return set === defaultSet || set === pristineSet ? clone(set) : set;
+  };
+
+  /**
    * _sanitizeElements
    *
    * @protect nodeName
@@ -1170,6 +1233,15 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Now let's check the element's type and name */
     const tagName = transformCaseFunc(currentNode.nodeName);
+
+    /* Fork ALLOWED_TAGS off a shared binding before a hook installed after
+       the per-walk clone can see it */
+    ALLOWED_TAGS = _forkSharedAllowlist(
+      'uponSanitizeElement',
+      ALLOWED_TAGS,
+      DEFAULT_ALLOWED_TAGS,
+      PRISTINE_ALLOWED_TAGS
+    );
 
     /* Execute a hook if present */
     _executeHook('uponSanitizeElement', currentNode, {
@@ -1231,10 +1303,15 @@ function createDOMPurify(window = getGlobal()) {
           return false;
       }
 
-      /* Keep content except for bad-listed elements */
+      /* Keep content except for bad-listed elements.
+         Use the cached prototype getters exclusively: a direct
+         `currentNode.parentNode` / `currentNode.childNodes` fallback is dead
+         in safe cases and a clobbering surface in unsafe ones. Falsy cached
+         results stay falsy; the `if (childNodes && parentNode)` check
+         already gates correctly. */
       if (KEEP_CONTENT && !FORBID_CONTENTS[tagName]) {
-        const parentNode = getParentNode(currentNode) || currentNode.parentNode;
-        const childNodes = getChildNodes(currentNode) || currentNode.childNodes;
+        const parentNode = getParentNode(currentNode);
+        const childNodes = getChildNodes(currentNode);
 
         if (childNodes && parentNode) {
           const childCount = childNodes.length;
@@ -1424,6 +1501,14 @@ function createDOMPurify(window = getGlobal()) {
     if (!attributes || _isClobbered(currentNode)) {
       return;
     }
+
+    /* Same late-installed hook guard as for uponSanitizeElement */
+    ALLOWED_ATTR = _forkSharedAllowlist(
+      'uponSanitizeAttribute',
+      ALLOWED_ATTR,
+      DEFAULT_ALLOWED_ATTR,
+      PRISTINE_ALLOWED_ATTR
+    );
 
     const hookEvent = {
       attrName: '',
@@ -1650,6 +1735,29 @@ function createDOMPurify(window = getGlobal()) {
       _parseConfig(cfg);
     }
 
+    /* Restore the allowlists from the pristine bindings of the active config.
+     * On the persistent setConfig() path _parseConfig is skipped, and it
+     * returns early for an already parsed config object, so without this a
+     * previous call's hook clone (mutated below) would carry over. */
+    ALLOWED_TAGS = PRISTINE_ALLOWED_TAGS;
+    ALLOWED_ATTR = PRISTINE_ALLOWED_ATTR;
+
+    /* The uponSanitizeElement hook event exposes ALLOWED_TAGS (as
+     * allowedTags) and the uponSanitizeAttribute hook event exposes
+     * ALLOWED_ATTR (as allowedAttributes) by reference. Without an explicit
+     * ALLOWED_TAGS / ALLOWED_ATTR those are the module-level defaults, so a
+     * hook that widens them would mutate the shared sets permanently, across
+     * later calls and even after removeAllHooks() / clearConfig(). Clone them
+     * per walk whenever such a hook is registered, so documented in-call
+     * widening only mutates this call's copy. */
+    if (_hasHooks('uponSanitizeElement')) {
+      ALLOWED_TAGS = clone(ALLOWED_TAGS);
+    }
+
+    if (_hasHooks('uponSanitizeAttribute')) {
+      ALLOWED_ATTR = clone(ALLOWED_ATTR);
+    }
+
     /* Clean up removed elements */
     DOMPurify.removed = [];
 
@@ -1846,6 +1954,8 @@ function createDOMPurify(window = getGlobal()) {
   DOMPurify.clearConfig = function () {
     CONFIG = null;
     SET_CONFIG = false;
+    PRISTINE_ALLOWED_TAGS = null;
+    PRISTINE_ALLOWED_ATTR = null;
   };
 
   /**
