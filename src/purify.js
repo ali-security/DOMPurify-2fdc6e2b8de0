@@ -1432,7 +1432,15 @@ function createDOMPurify(window = getGlobal()) {
          in safe cases and a clobbering surface in unsafe ones. Falsy cached
          results stay falsy; the `if (childNodes && parentNode)` check
          already gates correctly. */
-      if (KEEP_CONTENT && !FORBID_CONTENTS[tagName]) {
+      if (
+        KEEP_CONTENT &&
+        !FORBID_CONTENTS[tagName] &&
+        /* Never hoist a removed IN_PLACE root's content into the caller's
+           live parent: it lies outside the walk and would never be
+           sanitized. The root-removed throw in sanitize() refuses the call.
+           GHSA-6688-9rhm-gjv2 */
+        !(IN_PLACE && currentNode === root)
+      ) {
         const parentNode = getParentNode(currentNode);
         const childNodes = getChildNodes(currentNode);
 
@@ -2127,6 +2135,34 @@ function createDOMPurify(window = getGlobal()) {
 
     /* If we sanitized `dirty` in-place, return it. */
     if (IN_PLACE) {
+      /* The in-place ROOT may itself have been force-removed during the walk
+         (an mXSS-canary rawtext root such as a <style> whose text carries its
+         own end tag, a fallback-tag noscript/noembed/noframes root, a root a
+         hook disallowed or clobbered, a root in an invalid namespace, ...).
+         Such a root is detached (or, without a parent, could not be detached
+         at all), and for a rawtext element its text may still carry a
+         literal `</tag>`-bearing payload, so re-serialising and re-parsing
+         the returned node re-opens the markup.
+         There is no safe node to hand back: cancel the attribute axis on the
+         refused root and fail closed - identical in spirit to the
+         forbidden-root and clobbered-root throws at the IN_PLACE entry.
+         Covers every present and future root-kill reason in one check.
+         GHSA-6688-9rhm-gjv2 */
+      let rootWasRemoved = false;
+      arrayForEach(DOMPurify.removed, (entry) => {
+        if (entry.element === dirty) {
+          rootWasRemoved = true;
+        }
+      });
+
+      if (rootWasRemoved) {
+        _neutralizeSubtree(dirty);
+        throw typeErrorCreate(
+          'a node selected for removal could not be safely returned; ' +
+            'refusing to sanitize in place'
+        );
+      }
+
       if (SAFE_FOR_TEMPLATES) {
         _scrubTemplateExpressions(dirty);
       }

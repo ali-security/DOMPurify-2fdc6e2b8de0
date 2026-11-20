@@ -4816,6 +4816,335 @@
       }
     );
 
+    // -----------------------------------------------------------------------
+    // CVE-2026-109345 (GHSA-6688-9rhm-gjv2): an IN_PLACE root that the walk
+    // itself force-removes (a rawtext <style> root killed by the mXSS check,
+    // a fallback-tag root, a root a hook disallows, ...) used to be handed
+    // back to the caller, and KEEP_CONTENT hoisted the content of a removed
+    // root into the caller's live parent, outside the walk, where it was
+    // never sanitized. For a rawtext root whose text already carries its own
+    // end tag the literal serialization ("<style></style><img ...></style>")
+    // re-opens markup on a plain HTML reparse. sanitize() must refuse such a
+    // root instead of returning it.
+    // -----------------------------------------------------------------------
+    QUnit.test(
+      'CVE-2026-109345: a removed attached IN_PLACE root does not hoist its content into the live parent',
+      function (assert) {
+        // KEEP_CONTENT re-inserts a removed element's content after it. For
+        // the IN_PLACE root that lands in the caller's parent, outside the
+        // walk, where it would never be sanitized. This version refuses a
+        // disallowed root such as <x-widget> already at the IN_PLACE entry,
+        // before the walk starts, and leaves the caller's root untouched.
+        var doc = createInertDocument();
+        var parent = doc.createElement('div');
+        var root = doc.createElement('x-widget');
+        root.innerHTML = '<img src=x onerror=alert(1)><b>t</b>';
+        parent.appendChild(root);
+        assert.throws(function () {
+          DOMPurify.sanitize(root, { IN_PLACE: true });
+        }, /refusing to sanitize in place|cannot be sanitized in-place/);
+        var hoisted = 0;
+        for (var i = 0; i < parent.childNodes.length; i++) {
+          if (parent.childNodes[i] !== root) {
+            hoisted++;
+          }
+        }
+
+        assert.equal(
+          hoisted,
+          0,
+          'no unsanitized markup hoisted into the live parent: ' +
+            parent.innerHTML
+        );
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-109345: a root disallowed by a hook does not hoist its content into the live parent',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          // The root passes the IN_PLACE entry check, then a hook takes it
+          // off the allow-list, so the walk removes it with KEEP_CONTENT.
+          // Built in an inert document so an unpatched run can not fire the
+          // hoisted <img> handler in page scope.
+          var doc = createInertDocument();
+          var parent = doc.createElement('div');
+          var root = doc.createElement('div');
+          root.setAttribute('onclick', 'alert(1)');
+          root.innerHTML = '<img src=x onerror=alert(2)><b>t</b>';
+          parent.appendChild(root);
+
+          purify.addHook('uponSanitizeElement', function (node, data) {
+            if (node === root) {
+              delete data.allowedTags[data.tagName];
+            }
+          });
+
+          assert.throws(
+            function () {
+              purify.sanitize(root, { IN_PLACE: true });
+            },
+            /refusing to sanitize in place/,
+            'the removed root is not returned'
+          );
+          assert.equal(
+            parent.getElementsByTagName('img').length,
+            0,
+            'no unsanitized markup hoisted into the live parent'
+          );
+          assert.equal(
+            parent.querySelectorAll('[onerror],[onclick]').length,
+            0,
+            'no handler in the live parent: ' + parent.innerHTML
+          );
+          assert.equal(
+            root.getAttribute('onclick'),
+            null,
+            'the on* handler on the refused root is cancelled'
+          );
+          assert.equal(
+            root.querySelectorAll('[onerror],[onclick]').length,
+            0,
+            'no handler left in the refused subtree: ' + root.innerHTML
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-109345: throws instead of returning a force-removed rawtext root (mXSS reparse)',
+      function (assert) {
+        // A <style> passed as the IN_PLACE root whose text content already
+        // carries its own end tag is force-removed by the mXSS check: its
+        // literal serialization ("</style><img ...>") re-opens markup on an
+        // HTML reparse. The detached root must not be handed back to the
+        // caller. Fail closed - assert the return contract, not merely a
+        // scrubbed textContent, so a future refactor cannot pass by
+        // defanging text while still returning.
+        var dirty = document.createElement('style');
+        dirty.setAttribute('onclick', 'alert(1)');
+        dirty.textContent = '</style><img src=x onerror=alert(1)>';
+        document.body.appendChild(dirty);
+
+        assert.throws(
+          function () {
+            DOMPurify.sanitize(dirty, { IN_PLACE: true });
+          },
+          /refusing to sanitize in place/,
+          'force-removed rawtext root is not returned'
+        );
+        assert.ok(
+          DOMPurify.removed.some(function (entry) {
+            return entry.element === dirty;
+          }),
+          'root was recorded as removed during the aborted call'
+        );
+        assert.equal(
+          dirty.getAttribute('onclick'),
+          null,
+          'the on* handler on the refused root is cancelled'
+        );
+
+        if (dirty.parentNode) {
+          dirty.parentNode.removeChild(dirty);
+        }
+
+        window.xssed = false;
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-109345: still returns the root when a rawtext CHILD (not the root) is removed',
+      function (assert) {
+        // The fail-closed guard must fire ONLY when the ROOT itself is
+        // force-removed. A dangerous rawtext child is detached from the
+        // returned root as usual; the root remains safe to return, so the
+        // guard must not over-trigger on ordinary child removals.
+        var dirty = document.createElement('div');
+        dirty.innerHTML = '<span>ok</span>';
+        var style = document.createElement('style');
+        style.textContent = '</style><img src=x onerror=alert(1)>';
+        dirty.appendChild(style);
+        document.body.appendChild(dirty);
+
+        var clean = DOMPurify.sanitize(dirty, { IN_PLACE: true });
+        assert.equal(clean, dirty, 'returns the input root');
+        assert.equal(
+          dirty.querySelector('style'),
+          null,
+          'dangerous rawtext child removed from the returned root'
+        );
+        assert.equal(
+          dirty.querySelector('span').textContent,
+          'ok',
+          'safe sibling content preserved'
+        );
+
+        if (dirty.parentNode) {
+          dirty.parentNode.removeChild(dirty);
+        }
+
+        window.xssed = false;
+      }
+    );
+
+    // Exploit variants: every root-kill reason this version has (the mXSS
+    // check on rawtext roots, the fallback-tag check, the IN_PLACE entry
+    // refusal of disallowed and forbidden roots), attached and parent-less
+    // roots. Without the fix each root killed during the walk is handed
+    // back. Each case either refuses the root, or whatever is handed back
+    // must not re-open markup when the app stores and re-renders it
+    // (serialize + plain HTML reparse). The reparse probe builds an <img>
+    // without src, so nothing can load or fire in the live document.
+    var CVE_109345_SINK = '<img onerror="window.__cve109345 = 1">';
+    var cve109345ReparseSinks = function (node) {
+      var probe = document.createElement('div');
+      probe.innerHTML = node.outerHTML;
+      var sinks = probe.querySelectorAll('img, script, [onerror], [onclick]');
+      return sinks.length;
+    };
+
+    [
+      {
+        label: 'attached <style> root killed by the mXSS check',
+        tag: 'style',
+        attach: true,
+        cfg: {},
+        strict: true,
+      },
+      {
+        label: 'parent-less <style> root killed by the mXSS check',
+        tag: 'style',
+        attach: false,
+        cfg: {},
+        strict: true,
+      },
+      {
+        label: 'attached <xmp> root allowed via ADD_TAGS',
+        tag: 'xmp',
+        attach: true,
+        cfg: { ADD_TAGS: ['xmp'] },
+        strict: true,
+      },
+      {
+        label: 'parent-less <xmp> root allowed via ADD_TAGS',
+        tag: 'xmp',
+        attach: false,
+        cfg: { ADD_TAGS: ['xmp'] },
+        strict: true,
+      },
+      {
+        label: 'attached <noembed> root allowed via ADD_TAGS',
+        tag: 'noembed',
+        attach: true,
+        cfg: { ADD_TAGS: ['noembed'] },
+        strict: false,
+      },
+      {
+        label: 'attached <style> root forbidden via FORBID_TAGS',
+        tag: 'style',
+        attach: true,
+        cfg: { FORBID_TAGS: ['style'] },
+        strict: true,
+        entry: true,
+      },
+      {
+        label: 'parent-less disallowed <xmp> root',
+        tag: 'xmp',
+        attach: false,
+        cfg: {},
+        strict: true,
+        entry: true,
+      },
+      {
+        label: 'attached HTML-namespace <svg> root killed by the namespace check',
+        tag: 'svg',
+        html: '<p></p>' + CVE_109345_SINK,
+        attach: true,
+        cfg: {},
+        strict: true,
+      },
+    ].forEach(function (testCase) {
+      QUnit.test(
+        'CVE-2026-109345: IN_PLACE refuses a force-removed root: ' +
+          testCase.label,
+        function (assert) {
+          withFreshPurify(function (purify) {
+            var root = document.createElement(testCase.tag);
+            root.setAttribute('onclick', 'window.__cve109345 = 2');
+            if (testCase.html) {
+              root.innerHTML = testCase.html;
+            } else {
+              root.textContent = '</' + testCase.tag + '>' + CVE_109345_SINK;
+            }
+
+            if (testCase.attach) {
+              document.body.appendChild(root);
+            }
+
+            var cfg = { IN_PLACE: true };
+            Object.keys(testCase.cfg).forEach(function (key) {
+              cfg[key] = testCase.cfg[key];
+            });
+
+            var message = null;
+            var ret = null;
+            try {
+              ret = purify.sanitize(root, cfg);
+            } catch (error) {
+              message = String(error && error.message);
+            } finally {
+              if (root.parentNode) {
+                root.parentNode.removeChild(root);
+              }
+            }
+
+            /* This version refuses a disallowed or forbidden root already
+               at the IN_PLACE entry, before the walk starts. */
+            var refusal = testCase.entry
+              ? /root node is forbidden and cannot be sanitized in-place/
+              : /refusing to sanitize in place/;
+            var refused = refusal.test(message || '');
+            var rootRemoved = purify.removed.some(function (entry) {
+              return entry.element === root;
+            });
+            var sinks = ret ? cve109345ReparseSinks(ret) : 0;
+
+            if (testCase.strict || rootRemoved) {
+              assert.ok(
+                refused,
+                'force-removed IN_PLACE root must throw, got: ' +
+                  message +
+                  ', returned: ' +
+                  (ret ? ret.outerHTML : ret)
+              );
+            } else {
+              assert.ok(
+                refused || ret === root,
+                'root is refused or returned as-is, got: ' + message
+              );
+            }
+
+            assert.equal(
+              sinks,
+              0,
+              'nothing handed back re-opens markup on reparse: ' +
+                (ret ? ret.outerHTML : ret)
+            );
+            if (!testCase.entry) {
+              assert.equal(
+                root.getAttribute('onclick'),
+                null,
+                'the on* handler on the root is cancelled'
+              );
+            }
+
+            assert.notOk(window.__cve109345, 'no payload ran');
+          });
+        }
+      );
+    });
+
     QUnit.test('removeHook returns hook function', function (assert) {
       const entryPoint = 'afterSanitizeAttributes';
       const dirty = '<div class="hello"></div>';
