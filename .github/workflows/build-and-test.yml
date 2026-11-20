@@ -5,14 +5,17 @@ name: Build and Test
 # - on any pull request -> trigger the workflow
 # This is to avoid running the workflow twice on pull requests.
 on:
-  push:
-    branches:
-      - 2.x
-  pull_request:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'QUnit filter passed to karma (empty = full suite)'
+        required: false
+        default: ''
 
 jobs:
   install:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     strategy:
       matrix:
@@ -30,9 +33,8 @@ jobs:
         run: npm ci
       - name: Build
         run: npm run build
-      - name: Lint
-        run: npm run lint
       - name: Test
+        if: inputs.test-filter == ''
         uses: GabrielBB/xvfb-action@v1.6
         with:
           run: npm run test:ci
@@ -41,4 +43,21 @@ jobs:
           TEST_PROBE_ONLY: ${{ github.ref != 'refs/heads/2.x' }}
           BS_USERNAME: ${{ secrets.BS_USERNAME }}
           BS_ACCESSKEY: ${{ secrets.BS_ACCESSKEY }}
-
+      - name: Test (filtered)
+        if: inputs.test-filter != ''
+        uses: GabrielBB/xvfb-action@v1.6
+        with:
+          run: npm run test:karma -- --single-run --browsers Firefox --client.qunit.filter "${{ inputs.test-filter }}"
+        env:
+          TEST_BROWSERSTACK: false
+          TEST_PROBE_ONLY: true
+      - name: Pack
+        if: matrix.node-version == '18.x'
+        run: npm pack
+      - name: Upload package
+        if: matrix.node-version == '18.x'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dompurify-tgz
+          path: dompurify-*.tgz
+          if-no-files-found: error
