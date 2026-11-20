@@ -4129,6 +4129,225 @@
       }
     );
 
+    // -----------------------------------------------------------------------
+    // CVE-2026-65901 (GHSA-x4vx-rjvf-j5p4): a live node handed in with
+    // IN_PLACE can define an own nodeName. The allow/forbid decisions trusted
+    // that instance-visible property, so a real <script> claiming to be a
+    // "DIV" was kept and ran once the sanitized tree was inserted into the
+    // document, and an <a> claiming to be an "IMG" kept a data: URI. The name
+    // is now read through the cached Node.prototype getter, and a node whose
+    // own nodeName diverges from it is removed like any other clobbered node.
+    // -----------------------------------------------------------------------
+    var X4VX_DATA_URI =
+      'data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg==';
+    var spoofNodeName = function (node, name) {
+      Object.defineProperty(node, 'nodeName', {
+        value: name,
+        configurable: true,
+      });
+      return node;
+    };
+    var hasDataHref = function (node) {
+      return /^\s*data:/i.test(node.getAttribute('href') || '');
+    };
+
+    QUnit.test(
+      'CVE-2026-65901: IN_PLACE removes a <script> child spoofing nodeName as DIV',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var host = document.createElement('div');
+          var benign = document.createElement('p');
+          benign.appendChild(document.createTextNode('ok'));
+          host.appendChild(benign);
+          var script = document.createElement('script');
+          script.textContent = 'window.__x4vx_script = 1';
+          host.appendChild(spoofNodeName(script, 'DIV'));
+
+          var clean = purify.sanitize(host, { IN_PLACE: true });
+
+          assert.strictEqual(clean, host, 'the root node itself is returned');
+          assert.notEqual(
+            script.parentNode,
+            host,
+            '<script> spoofing nodeName as DIV is removed'
+          );
+          assert.equal(
+            host.childNodes.length,
+            1,
+            'only the benign child is left'
+          );
+          assert.strictEqual(host.firstChild, benign, 'benign <p> is kept');
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65901: IN_PLACE does not keep a data: href on an <a> spoofing nodeName as IMG',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var host = document.createElement('div');
+          var link = document.createElement('a');
+          link.setAttribute('href', X4VX_DATA_URI);
+          link.appendChild(document.createTextNode('click'));
+          host.appendChild(spoofNodeName(link, 'IMG'));
+
+          purify.sanitize(host, { IN_PLACE: true });
+
+          assert.ok(
+            link.parentNode !== host || !hasDataHref(link),
+            '<a> spoofing nodeName as IMG is removed or loses its data: href'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65901: a nodeName getter switching to IMG after the first reads can not keep a data: href',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var host = document.createElement('div');
+          var link = document.createElement('a');
+          link.setAttribute('href', X4VX_DATA_URI);
+          link.appendChild(document.createTextNode('click'));
+          host.appendChild(link);
+          // Consistent while the node is checked for clobbering and its tag
+          // name is looked up, spoofed for the attribute checks after
+          var reads = 0;
+          Object.defineProperty(link, 'nodeName', {
+            get: function () {
+              reads++;
+              return reads <= 2 ? 'A' : 'IMG';
+            },
+            configurable: true,
+          });
+
+          purify.sanitize(host, { IN_PLACE: true });
+
+          assert.ok(
+            link.parentNode !== host || !hasDataHref(link),
+            'data: href is not kept by a nodeName that turns into IMG'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65901: IN_PLACE root spoofing nodeName is refused',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var root = document.createElement('script');
+          root.textContent = 'window.__x4vx_root = 1';
+          spoofNodeName(root, 'DIV');
+
+          var message = null;
+          try {
+            purify.sanitize(root, { IN_PLACE: true });
+          } catch (error) {
+            message = String(error && error.message);
+          }
+
+          // The root pre-check reads the name through the cached getter, so
+          // the real <script> is refused as a forbidden root
+          assert.ok(
+            message !== null && /forbidden|clobbered/.test(message),
+            'spoofed IN_PLACE root must throw, got: ' + message
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65901: IN_PLACE root <a> spoofing nodeName as IMG keeps no data: href',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var root = document.createElement('a');
+          root.setAttribute('href', X4VX_DATA_URI);
+          root.appendChild(document.createTextNode('click'));
+          spoofNodeName(root, 'IMG');
+
+          var message = null;
+          try {
+            purify.sanitize(root, { IN_PLACE: true });
+          } catch (error) {
+            message = String(error && error.message);
+          }
+
+          assert.ok(
+            (message !== null && /clobbered/.test(message)) ||
+              !hasDataHref(root),
+            'spoofed <a> root is refused or loses its data: href, got: ' +
+              message
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65901: IN_PLACE removes an adopted <script> spoofing nodeName as DIV',
+      function (assert) {
+        if (
+          !document.implementation ||
+          typeof document.implementation.createHTMLDocument !== 'function' ||
+          typeof document.adoptNode !== 'function'
+        ) {
+          assert.ok(true, 'SKIP: no createHTMLDocument / adoptNode');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          // Build the hostile subtree in another document, then adopt it into
+          // this one before sanitizing it in place
+          var source = document.implementation.createHTMLDocument('');
+          var host = source.createElement('div');
+          var script = source.createElement('script');
+          script.textContent = 'window.__x4vx_adopted = 1';
+          host.appendChild(spoofNodeName(script, 'DIV'));
+          var link = source.createElement('a');
+          link.setAttribute('href', X4VX_DATA_URI);
+          host.appendChild(spoofNodeName(link, 'IMG'));
+          host = document.adoptNode(host);
+
+          purify.sanitize(host, { IN_PLACE: true });
+
+          assert.notEqual(
+            script.parentNode,
+            host,
+            'adopted <script> spoofing nodeName as DIV is removed'
+          );
+          assert.ok(
+            link.parentNode !== host || !hasDataHref(link),
+            'adopted <a> spoofing nodeName as IMG keeps no data: href'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-65901: IN_PLACE removes a foreign-realm <script> spoofing nodeName as DIV',
+      function (assert) {
+        var realmPurify = createForeignRealmPurify();
+        var host = document.createElement('div');
+        var script = document.createElement('script');
+        script.textContent = 'window.__x4vx_foreign = 1';
+        host.appendChild(spoofNodeName(script, 'DIV'));
+        var link = document.createElement('a');
+        link.setAttribute('href', X4VX_DATA_URI);
+        host.appendChild(spoofNodeName(link, 'IMG'));
+
+        realmPurify.sanitize(host, { IN_PLACE: true });
+
+        assert.notEqual(
+          script.parentNode,
+          host,
+          'foreign realm: <script> spoofing nodeName as DIV is removed'
+        );
+        assert.ok(
+          link.parentNode !== host || !hasDataHref(link),
+          'foreign realm: <a> spoofing nodeName as IMG keeps no data: href'
+        );
+      }
+    );
+
     QUnit.test('removeHook returns hook function', function (assert) {
       const entryPoint = 'afterSanitizeAttributes';
       const dirty = '<div class="hello"></div>';

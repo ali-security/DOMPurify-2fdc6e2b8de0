@@ -1082,6 +1082,16 @@ function createDOMPurify(window = getGlobal()) {
        below instead of trusting it. */
     const realNodeType = _getNodeType(elm);
     const realNodeName = _getNodeName(elm);
+
+    /* NodeName spoofing probe (GHSA-x4vx-rjvf-j5p4). Not only a form: any
+       live node handed in with IN_PLACE can define an own nodeName (e.g. a
+       <script> claiming to be a "DIV"), which diverges from the cached
+       Node.prototype getter. Such a node is hostile, treat it like any other
+       clobbered node. */
+    if (realNodeName !== null && elm.nodeName !== realNodeName) {
+      return true;
+    }
+
     if (
       (realNodeType !== null && realNodeType !== 1) ||
       (realNodeName !== null && stringToLowerCase(realNodeName) !== 'form')
@@ -1235,14 +1245,18 @@ function createDOMPurify(window = getGlobal()) {
       return true;
     }
 
+    /* Read the name through the cached getter, an own nodeName property can
+       not spoof it (GHSA-x4vx-rjvf-j5p4) */
+    const nodeName = _getNodeName(currentNode) || currentNode.nodeName;
+
     /* Check if tagname contains Unicode */
-    if (regExpTest(/[\u0080-\uFFFF]/, currentNode.nodeName)) {
+    if (regExpTest(/[\u0080-\uFFFF]/, nodeName)) {
       _forceRemove(currentNode);
       return true;
     }
 
     /* Now let's check the element's type and name */
-    const tagName = transformCaseFunc(currentNode.nodeName);
+    const tagName = transformCaseFunc(nodeName);
 
     /* Fork ALLOWED_TAGS off a shared binding before a hook installed after
        the per-walk clone can see it */
@@ -1569,8 +1583,12 @@ function createDOMPurify(window = getGlobal()) {
         value = stringReplace(value, TMPLIT_EXPR, ' ');
       }
 
-      /* Is `value` valid for this attribute? */
-      const lcTag = transformCaseFunc(currentNode.nodeName);
+      /* Is `value` valid for this attribute? The tag name is read through
+         the cached getter, so a spoofed nodeName (e.g. an <a> claiming to
+         be an "IMG") can not unlock data: URIs (GHSA-x4vx-rjvf-j5p4) */
+      const lcTag = transformCaseFunc(
+        _getNodeName(currentNode) || currentNode.nodeName
+      );
       if (!_isValidAttribute(lcTag, lcName, value)) {
         continue;
       }
