@@ -903,6 +903,53 @@ function createDOMPurify(window = getGlobal()) {
   };
 
   /**
+   * _scrubTemplateExpressions
+   * Strip template-engine expressions ({{...}}, <%...%>, ${...}) from the
+   * character data of a subtree. Used as the final safety net for
+   * SAFE_FOR_TEMPLATES on every DOM-returning code path so that expressions
+   * which only form after text-node normalization (e.g. fragments split across
+   * stripped elements) cannot survive into a template-evaluating framework.
+   *
+   * Walks text/comment/CDATA/processing-instruction nodes and rewrites their
+   * `.data` in place instead of round-tripping through innerHTML. Writing
+   * serialized markup back reparses it: the text of a DOM-built rawtext
+   * element (e.g. a <style> holding `</style><img onerror=...>`) would come
+   * back as live, never-sanitized elements, and every descendant the caller
+   * holds a reference to would be replaced. NodeIterator does not enter
+   * <template>.content, so each template's content is scrubbed explicitly,
+   * unless ownDataOnly is set: _sanitizeShadowDOM scrubs each fragment it
+   * walks, nested template contents included, so recursing there would
+   * rescrub every nested fragment once per ancestor.
+   *
+   * @param  {Node} node The root node whose character data should be scrubbed
+   * @param  {Boolean} ownDataOnly Do not recurse into <template>.content
+   */
+  const _scrubTemplateExpressions = function (node, ownDataOnly) {
+    node.normalize();
+    const walker = _createIterator(node);
+
+    let currentNode;
+    while ((currentNode = walker.nextNode())) {
+      if (currentNode.nodeType === 1) {
+        const { content } = currentNode;
+        if (!ownDataOnly && content && content.nodeType === 11) {
+          _scrubTemplateExpressions(content);
+        }
+
+        continue;
+      }
+
+      let { data } = currentNode;
+      data = stringReplace(data, MUSTACHE_EXPR, ' ');
+      data = stringReplace(data, ERB_EXPR, ' ');
+      data = stringReplace(data, TMPLIT_EXPR, ' ');
+      if (currentNode.data !== data) {
+        currentNode.data = data;
+      }
+    }
+  };
+
+  /**
    * _isClobbered
    *
    * @param  {Node} elm element to check for clobbering attacks
@@ -1388,6 +1435,15 @@ function createDOMPurify(window = getGlobal()) {
       }
     }
 
+    /* The per-node strip in _sanitizeElements sees each text node alone, so
+       an expression split across text nodes by a removed element survives
+       inside template content: NodeIterator does not enter it and
+       normalize() on the light DOM does not merge across that boundary.
+       Merge and re-scrub this fragment before the hook sees it. */
+    if (SAFE_FOR_TEMPLATES) {
+      _scrubTemplateExpressions(fragment, true);
+    }
+
     /* Execute a hook if present */
     _executeHook('afterSanitizeShadowDOM', fragment, null);
   };
@@ -1537,11 +1593,19 @@ function createDOMPurify(window = getGlobal()) {
 
     /* If we sanitized `dirty` in-place, return it. */
     if (IN_PLACE) {
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(dirty);
+      }
+
       return dirty;
     }
 
     /* Return sanitized string or DOM */
     if (RETURN_DOM) {
+      if (SAFE_FOR_TEMPLATES) {
+        _scrubTemplateExpressions(body);
+      }
+
       if (RETURN_DOM_FRAGMENT) {
         returnNode = createDocumentFragment.call(body.ownerDocument);
 

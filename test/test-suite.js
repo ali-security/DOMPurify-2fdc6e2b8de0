@@ -666,6 +666,262 @@
         });
       }
     );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES strips boundary-spanning Mustache expressions in IN_PLACE mode',
+      function (assert) {
+        // Regression for the IN_PLACE counterpart of CVE-2026-41239.
+        // Per-text-node scrubbing alone misses {{...}} whose halves sit on
+        // either side of a stripped foreign element: each text node holds only
+        // a single '{' or '}', so MUSTACHE_EXPR (which requires '{{' or '}}')
+        // matches nothing. After sanitization removes the foreign element the
+        // surrounding text fragments are adjacent, and the serialized
+        // innerHTML — which is what a template-evaluating framework reads —
+        // shows '{{...}}' as a single interpolatable expression.
+        var dirty = document.createElement('div');
+        dirty.innerHTML =
+          '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+        var clean = DOMPurify.sanitize(dirty, {
+          SAFE_FOR_TEMPLATES: true,
+          IN_PLACE: true,
+        });
+        assert.equal(dirty, clean, 'should return the input node');
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(dirty.innerHTML),
+          'merged Mustache expression should be scrubbed'
+        );
+        assert.notOk(
+          /constructor/.test(dirty.innerHTML),
+          'expression body should not survive scrubbing'
+        );
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES strips boundary-spanning ERB and template literal expressions',
+      function (assert) {
+        // CVE-2026-41239: the final scrub applies every SAFE_FOR_TEMPLATES
+        // expression (MUSTACHE_EXPR, ERB_EXPR and TMPLIT_EXPR), not just
+        // Mustache, to the merged text of the DOM-returning code paths.
+        var dirty = document.createElement('div');
+        dirty.innerHTML = '$<foo></foo>{alert(1)}';
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.notOk(
+          /\$\{/.test(dirty.textContent),
+          'merged template literal expression should be scrubbed in IN_PLACE mode'
+        );
+        dirty = document.createElement('div');
+        dirty.innerHTML = '&lt;<foo></foo>% alert(1) %<foo></foo>&gt;';
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.notOk(
+          /<%|%>/.test(dirty.textContent),
+          'merged ERB expression should be scrubbed in IN_PLACE mode'
+        );
+        var returnNode = DOMPurify.sanitize('$<foo></foo>{alert(1)}', {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(
+          /\$\{/.test(returnNode.textContent),
+          'merged template literal expression should be scrubbed in RETURN_DOM mode'
+        );
+        returnNode = DOMPurify.sanitize(
+          '&lt;<foo></foo>% alert(1) %<foo></foo>&gt;',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          }
+        );
+        assert.notOk(
+          /<%|%>/.test(returnNode.textContent),
+          'merged ERB expression should be scrubbed in RETURN_DOM mode'
+        );
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES pins RETURN_DOM_FRAGMENT scrub behavior',
+      function (assert) {
+        // RETURN_DOM_FRAGMENT was fixed alongside RETURN_DOM in CVE-2026-41239
+        // (both scrub the sanitized body before it is returned). Pinning the
+        // fragment path here so future refactors of the post-walk return
+        // logic do not silently regress it.
+        var result = DOMPurify.sanitize(
+          '<div>{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}</div>',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM_FRAGMENT: true,
+          }
+        );
+        var container = document.createElement('div');
+        container.appendChild(result);
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(container.innerHTML),
+          'merged Mustache expression should be scrubbed in fragment mode'
+        );
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES scrub does not reparse DOM-built markup',
+      function (assert) {
+        // CVE-2026-41239 (upstream 688d372e): the final template scrub must not
+        // serialize the tree and write it back through innerHTML. A DOM-built
+        // <style> whose text closes the element would reparse into a live,
+        // never-sanitized <img onerror>. The <b> child keeps the <style> past
+        // the namespace-confusion mXSS check so the scrub actually sees it.
+        var payload = '</style><img src=x onerror=alert(1)>';
+        var dirty = document.createElement('div');
+        var style = document.createElement('style');
+        style.appendChild(document.createTextNode(payload));
+        style.appendChild(document.createElement('b'));
+        dirty.appendChild(style);
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.equal(
+          dirty.getElementsByTagName('img').length,
+          0,
+          'IN_PLACE scrub must not create elements'
+        );
+        assert.equal(dirty.firstChild, style, 'node references are kept');
+        dirty = document.createElement('div');
+        style = document.createElement('style');
+        style.appendChild(document.createTextNode(payload));
+        style.appendChild(document.createElement('b'));
+        dirty.appendChild(style);
+        var returnNode = DOMPurify.sanitize(dirty, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.equal(
+          returnNode.getElementsByTagName('img').length,
+          0,
+          'RETURN_DOM scrub must not create elements'
+        );
+        // Merged expressions are still scrubbed from text and comments
+        dirty = document.createElement('div');
+        dirty.innerHTML = '<p>{<foo></foo>{x}<foo></foo>}</p>';
+        var p = dirty.firstChild;
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.equal(dirty.firstChild, p, 'node references are kept');
+        assert.notOk(/\{\{/.test(dirty.innerHTML), 'expression is scrubbed');
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES scrubs split expressions in walked fragments',
+      function (assert) {
+        // CVE-2026-41239 (upstream fdfd5a3f): each fragment _sanitizeShadowDOM
+        // walks is normalized and scrubbed once its walk is done, so the
+        // halves of an expression split by a removed element do not rejoin.
+        var template = document.createElement('template');
+        if (!template.content || template.content.nodeType !== 11) {
+          assert.ok(true, 'no template support');
+          return;
+        }
+
+        var clean = DOMPurify.sanitize(
+          '<template>{<foo></foo>{x()}<foo></foo>}</template>',
+          { SAFE_FOR_TEMPLATES: true, RETURN_DOM: true, FORCE_BODY: true }
+        );
+        var content = clean.getElementsByTagName('template')[0].content;
+        assert.notOk(/\{\{/.test(content.textContent), 'template content');
+        // The fragment is already scrubbed when afterSanitizeShadowDOM runs
+        var hookSawExpression = false;
+        DOMPurify.addHook('afterSanitizeShadowDOM', function (fragment) {
+          if (/\{\{/.test(fragment.textContent)) {
+            hookSawExpression = true;
+          }
+        });
+        try {
+          DOMPurify.sanitize(
+            '<template>{<foo></foo>{x()}<foo></foo>}</template>',
+            { SAFE_FOR_TEMPLATES: true, FORCE_BODY: true }
+          );
+        } finally {
+          DOMPurify.removeHooks('afterSanitizeShadowDOM');
+        }
+
+        assert.notOk(hookSawExpression, 'walked fragment is scrubbed');
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES scrubs template content after normalization',
+      function (assert) {
+        // CVE-2026-41239: NodeIterator does not enter <template>.content, so
+        // the final scrub recurses into it explicitly (upstream fdfd5a3f).
+        var template = document.createElement('template');
+        if (!template.content || template.content.nodeType !== 11) {
+          assert.ok(true, 'no template support');
+          return;
+        }
+
+        var dirty = document.createElement('div');
+        dirty.appendChild(template);
+        var content = template.content;
+        content.appendChild(document.createTextNode('{'));
+        content.appendChild(document.createElement('foo'));
+        content.appendChild(document.createTextNode('{x}'));
+        content.appendChild(document.createElement('foo'));
+        content.appendChild(document.createTextNode('}'));
+        DOMPurify.sanitize(dirty, { SAFE_FOR_TEMPLATES: true, IN_PLACE: true });
+        assert.notOk(
+          /\{\{/.test(template.content.textContent),
+          'merged expression inside template content is scrubbed'
+        );
+      }
+    );
+    QUnit.test(
+      'Config-Flag tests: SAFE_FOR_TEMPLATES with RETURN_DOM',
+      function (assert) {
+        // CVE-2026-41239: the expression halves only merge once the foreign
+        // elements are stripped, so the returned body must be scrubbed too.
+        var returnNode = DOMPurify.sanitize(
+          '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+          }
+        );
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(returnNode.innerHTML),
+          'merged Mustache expression should be scrubbed in RETURN_DOM mode'
+        );
+        assert.notOk(
+          /constructor/.test(returnNode.innerHTML),
+          'expression body should not survive scrubbing'
+        );
+        // Same payload passed in as a DOM node
+        var dirty = document.createElement('div');
+        dirty.innerHTML =
+          '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}';
+        returnNode = DOMPurify.sanitize(dirty, {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(returnNode.innerHTML),
+          'merged Mustache expression should be scrubbed for DOM node input'
+        );
+        assert.notOk(
+          /constructor/.test(returnNode.innerHTML),
+          'expression body should not survive scrubbing for DOM node input'
+        );
+        // Same payload with the returned node imported into the document
+        returnNode = DOMPurify.sanitize(
+          '{<foo></foo>{constructor.constructor("alert(1)")()}<foo></foo>}',
+          {
+            SAFE_FOR_TEMPLATES: true,
+            RETURN_DOM: true,
+            ADD_ATTR: ['shadowroot'],
+          }
+        );
+        assert.notOk(
+          /\{\{[\s\S]*\}\}/.test(returnNode.innerHTML),
+          'merged Mustache expression should be scrubbed for an imported node'
+        );
+        // Markup without template expressions is left intact
+        returnNode = DOMPurify.sanitize('<a>123</a><b>456</b>', {
+          SAFE_FOR_TEMPLATES: true,
+          RETURN_DOM: true,
+        });
+        assert.equal(returnNode.innerHTML, '<a>123</a><b>456</b>');
+      }
+    );
     QUnit.test('Config-Flag tests: FORBID_TAGS', function (assert) {
       //FORBID_TAGS
       assert.equal(
