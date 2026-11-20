@@ -103,6 +103,23 @@ export function clone(object) {
   return newObject;
 }
 
+/* Like lookupGetter, but returns null instead of a stub when no prototype
+ * on the chain defines a getter for prop. That is the case for DOM
+ * properties an engine keeps on the instance, as WebKit and Blink did before
+ * WebIDL accessors (Safari < 10, Chrome < 43). */
+function lookupAccessor(object, prop) {
+  while (object !== null) {
+    const desc = getOwnPropertyDescriptor(object, prop);
+    if (desc) {
+      return desc.get ? unapply(desc.get) : null;
+    }
+
+    object = getPrototypeOf(object);
+  }
+
+  return null;
+}
+
 /* IE10 doesn't support __lookupGetter__ so lets'
  * simulate it. It also automatically checks
  * if the prop is function or getter and behaves
@@ -159,5 +176,6 @@ export {
   // Errors
   typeErrorCreate,
   // Other
+  lookupAccessor,
   lookupGetter,
 };
