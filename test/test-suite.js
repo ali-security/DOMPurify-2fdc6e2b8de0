@@ -4348,6 +4348,474 @@
       }
     );
 
+    // -----------------------------------------------------------------------
+    // CVE-2026-75838 (GHSA-55q2-fjhq-7xh7, GHSA-p98j-92pf-mc4p): a hook that
+    // detaches a node via node.remove() (the documented removal pattern)
+    // takes the subtree out of the tree before the walker reaches its
+    // descendants - so they are never visited, and hook-detached nodes are
+    // not recorded in DOMPurify.removed. On the IN_PLACE path the caller
+    // built that subtree in the live document, so a descendant that was
+    // already loading kept its queued on* handler and fired in page scope
+    // after sanitize returned, even though the returned tree was clean.
+    // Covers every per-node hook site that can detach the node:
+    // beforeSanitizeElements, uponSanitizeElement, afterSanitizeElements,
+    // beforeSanitizeAttributes and afterSanitizeAttributes (the after* hooks
+    // are the documented place for node.remove() policies).
+    // -----------------------------------------------------------------------
+    var detachNode = function (node) {
+      if (typeof node.remove === 'function') {
+        node.remove();
+      } else {
+        node.parentNode.removeChild(node);
+      }
+    };
+
+    var detachingHooks = [
+      'uponSanitizeElement',
+      'beforeSanitizeElements',
+      'afterSanitizeElements',
+      'beforeSanitizeAttributes',
+      'afterSanitizeAttributes',
+    ];
+
+    detachingHooks.forEach(function (hook) {
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE: ' +
+          hook +
+          ' node.remove() neutralizes the detached subtree',
+        function (assert) {
+          var root = document.createElement('div');
+          root.innerHTML =
+            '<section><img id="tail" onerror="alert(1)"></section>' +
+            '<div>safe</div>';
+          var tail = root.querySelector('#tail');
+
+          DOMPurify.addHook(hook, function (node) {
+            if (node.nodeName === 'SECTION') {
+              detachNode(node);
+            }
+          });
+
+          try {
+            var ret = DOMPurify.sanitize(root, { IN_PLACE: true });
+
+            assert.equal(ret, root, 'returns the same in-place node');
+            assert.notOk(
+              ret.querySelector('section, #tail'),
+              'detached subtree is absent from the returned tree'
+            );
+            assert.strictEqual(
+              tail.getAttribute('onerror'),
+              null,
+              'on* handler stripped from the hook-detached descendant'
+            );
+
+            // App-side store-and-rerender must expose no executable sink.
+            var probe = document.createElement('div');
+            probe.innerHTML = ret.outerHTML + tail.outerHTML;
+            assert.notOk(
+              probe.querySelector('[onerror],[onload],script'),
+              'no executable sink survives serialize/reparse: ' +
+                probe.innerHTML
+            );
+          } finally {
+            DOMPurify.removeHook(hook);
+          }
+        }
+      );
+
+      QUnit.test(
+        'CVE-2026-75838: IN_PLACE: ' +
+          hook +
+          ' node.remove() leaves no loading handler to fire after sanitize',
+        function (assert) {
+          var done = assert.async();
+          var sentinel = '__cve75838_' + hook;
+          window[sentinel] = 0;
+
+          withFreshPurify(function (purify) {
+            // The <img> starts loading (and fails) as soon as the markup is
+            // parsed in the live document, before sanitize runs; its error
+            // event is queued and fires after sanitize returns.
+            var root = document.createElement('div');
+            root.innerHTML =
+              '<section><p><img src="data:,x" onerror="window.' +
+              sentinel +
+              ' = 1"></p></section><div>safe</div>';
+
+            purify.addHook(hook, function (node) {
+              if (node.nodeName === 'SECTION') {
+                detachNode(node);
+              }
+            });
+
+            purify.sanitize(root, { IN_PLACE: true });
+
+            assert.notOk(
+              root.querySelector('section, img'),
+              'detached subtree is absent from the returned tree'
+            );
+          });
+
+          setTimeout(function () {
+            assert.strictEqual(
+              window[sentinel],
+              0,
+              'handler of the hook-detached <img> must not fire in page scope'
+            );
+            try {
+              delete window[sentinel];
+            } catch (_) {
+              window[sentinel] = undefined;
+            }
+
+            done();
+          }, 500);
+        }
+      );
+    });
+
+    // Every way a hook can take a node out of the IN_PLACE tree (remove(),
+    // removeChild(), replaceChild() with a safe stand-in) leaves no handler
+    // anywhere in the deep detached subtree, while allow-listed attributes on
+    // it are kept and the kept part of the tree is still sanitized.
+    var hasEventHandler = function (element) {
+      for (var i = 0; i < element.attributes.length; i++) {
+        if (/^on/i.test(element.attributes[i].name)) {
+          return true;
+        }
+      }
+
+      return false;
+    };
+
+    [
+      ['remove()', detachNode],
+      [
+        'removeChild()',
+        function (node) {
+          node.parentNode.removeChild(node);
+        },
+      ],
+      [
+        'replaceChild()',
+        function (node) {
+          node.parentNode.replaceChild(
+            node.ownerDocument.createElement('span'),
+            node
+          );
+        },
+      ],
+    ].forEach(function (detachCase) {
+      detachingHooks.forEach(function (hook) {
+        QUnit.test(
+          'CVE-2026-75838: IN_PLACE: ' +
+            hook +
+            ' detaching via ' +
+            detachCase[0] +
+            ' neutralizes every descendant of the detached subtree',
+          function (assert) {
+            withFreshPurify(function (purify) {
+              var root = document.createElement('div');
+              root.innerHTML =
+                '<article onmouseover="alert(1)"><div title="keep">' +
+                '<img id="deep" onerror="alert(2)" onload="alert(3)">' +
+                '<svg><g onclick="alert(4)"></g></svg>' +
+                '<video><source onerror="alert(5)"></video>' +
+                '<p><b><i><img onerror="alert(6)"></i></b></p>' +
+                '</div></article>' +
+                '<p onclick="alert(7)">kept</p>';
+              var detached = root.querySelector('article');
+              var keepTitle = root.querySelector('[title]');
+              var kept = root.querySelector('p[onclick]');
+
+              purify.addHook(hook, function (node) {
+                if (node.nodeName === 'ARTICLE') {
+                  detachCase[1](node);
+                }
+              });
+
+              var ret = purify.sanitize(root, { IN_PLACE: true });
+
+              assert.strictEqual(ret, root, 'returns the same in-place node');
+              assert.notOk(
+                ret.querySelector('article'),
+                'detached subtree is absent from the returned tree'
+              );
+
+              var offenders = [];
+              var elements = [detached].concat(
+                Array.prototype.slice.call(detached.querySelectorAll('*'))
+              );
+              for (var i = 0; i < elements.length; i++) {
+                if (hasEventHandler(elements[i])) {
+                  offenders.push(elements[i].nodeName);
+                }
+              }
+
+              assert.equal(
+                offenders.join(','),
+                '',
+                'no on* handler survives in the hook-detached subtree'
+              );
+              assert.equal(
+                keepTitle.getAttribute('title'),
+                'keep',
+                'allow-listed attributes on the detached subtree are kept'
+              );
+              assert.strictEqual(
+                kept.getAttribute('onclick'),
+                null,
+                'the kept part of the tree is still sanitized'
+              );
+              assert.notOk(
+                /\son\w+=/i.test(ret.outerHTML + detached.outerHTML),
+                'no handler survives serialization: ' +
+                  ret.outerHTML +
+                  detached.outerHTML
+              );
+            });
+          }
+        );
+      });
+    });
+
+    QUnit.test(
+      'CVE-2026-75838: IN_PLACE: neutralization only strips non-allow-listed attributes',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          var root = document.createElement('div');
+          root.innerHTML =
+            '<section title="t"><a id="tail" href="https://example.com/" ' +
+            'class="c" onclick="alert(1)">x</a>' +
+            '<a id="js" href="javascript:alert(2)">y</a></section>' +
+            '<p class="kept">safe</p>';
+          var tail = root.querySelector('#tail');
+          var js = root.querySelector('#js');
+
+          purify.addHook('uponSanitizeElement', function (node) {
+            if (node.nodeName === 'SECTION') {
+              detachNode(node);
+            }
+          });
+
+          purify.sanitize(root, { IN_PLACE: true });
+
+          assert.strictEqual(
+            tail.getAttribute('onclick'),
+            null,
+            'on* handler stripped from the detached descendant'
+          );
+          assert.strictEqual(
+            js.getAttribute('href'),
+            null,
+            'script URI stripped from the detached descendant'
+          );
+          assert.strictEqual(
+            tail.getAttribute('href'),
+            'https://example.com/',
+            'allow-listed href is kept on the detached descendant'
+          );
+          assert.strictEqual(tail.getAttribute('class'), 'c');
+          assert.equal(
+            root.innerHTML,
+            '<p class="kept">safe</p>',
+            'the attached remainder is sanitized as usual'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-75838: IN_PLACE: a hook detaching a node inside an attached shadow root neutralizes it',
+      function (assert) {
+        var doc = document.implementation.createHTMLDocument('');
+        var root = doc.createElement('div');
+        if (typeof root.attachShadow !== 'function') {
+          assert.ok(true, 'Shadow DOM is not supported, nothing to test');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var host = doc.createElement('div');
+          root.appendChild(host);
+          var shadowRoot = host.attachShadow({ mode: 'open' });
+          shadowRoot.innerHTML =
+            '<section><img id="tail" onerror="alert(1)"></section>' +
+            '<img id="kept" onerror="alert(2)">';
+          var tail = shadowRoot.querySelector('#tail');
+          var kept = shadowRoot.querySelector('#kept');
+
+          purify.addHook('uponSanitizeElement', function (node) {
+            if (node.nodeName === 'SECTION') {
+              detachNode(node);
+            }
+          });
+
+          purify.sanitize(root, { IN_PLACE: true });
+
+          assert.notOk(
+            shadowRoot.querySelector('section'),
+            'detached subtree is absent from the shadow root'
+          );
+          assert.strictEqual(
+            tail.getAttribute('onerror'),
+            null,
+            'on* handler stripped from the hook-detached shadow descendant'
+          );
+          assert.strictEqual(
+            kept.getAttribute('onerror'),
+            null,
+            'the kept part of the shadow root is still sanitized'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-75838: IN_PLACE: a parent-less root is still sanitized while hooks are registered',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          // The walk root is exempt from the hook-detach handling: a
+          // detached IN_PLACE root is legitimate input and must be sanitized.
+          var root = document.createElement('div');
+          root.setAttribute('onmouseover', 'alert(1)');
+          root.innerHTML =
+            '<section><img onerror="alert(2)"></section>' +
+            '<img id="kept" onerror="alert(3)">';
+          var seen = [];
+          purify.addHook('beforeSanitizeElements', function (node) {
+            seen.push(node.nodeName);
+          });
+          purify.addHook('uponSanitizeElement', function (node) {
+            if (node.nodeName === 'SECTION') {
+              detachNode(node);
+            }
+          });
+
+          var ret = purify.sanitize(root, { IN_PLACE: true });
+
+          assert.strictEqual(ret, root, 'returns the same in-place node');
+          assert.strictEqual(
+            root.getAttribute('onmouseover'),
+            null,
+            'on* handler stripped from the parent-less root'
+          );
+          assert.strictEqual(
+            root.querySelector('#kept').getAttribute('onerror'),
+            null,
+            'on* handler stripped from the kept sibling'
+          );
+          assert.equal(seen[0], 'DIV', 'the root itself was walked');
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-75838: IN_PLACE: a parent-less root is fully attribute-sanitized while every detach-checked hook is registered',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          // The root is exempt at the attribute hook sites too: it must go
+          // through the full attribute pass (URI checks included), not only
+          // the allowlist strip used for discarded subtrees.
+          var root = document.createElement('a');
+          root.setAttribute('href', 'javascript:alert(1)');
+          root.setAttribute('onclick', 'alert(2)');
+          root.innerHTML = '<img id="kept" onerror="alert(3)">';
+          var seen = [];
+          detachingHooks.forEach(function (hook) {
+            purify.addHook(hook, function (node) {
+              if (node === root) {
+                seen.push(hook);
+              }
+            });
+          });
+
+          var ret = purify.sanitize(root, { IN_PLACE: true });
+
+          assert.strictEqual(ret, root, 'returns the same in-place node');
+          assert.strictEqual(
+            root.getAttribute('href'),
+            null,
+            'unsafe URI stripped from the parent-less root'
+          );
+          assert.strictEqual(
+            root.getAttribute('onclick'),
+            null,
+            'on* handler stripped from the parent-less root'
+          );
+          assert.strictEqual(
+            root.querySelector('#kept').getAttribute('onerror'),
+            null,
+            'on* handler stripped from the kept child'
+          );
+          assert.equal(
+            seen.join(','),
+            'beforeSanitizeElements,uponSanitizeElement,afterSanitizeElements,' +
+              'beforeSanitizeAttributes,afterSanitizeAttributes',
+            'every hook ran for the root'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-75838: IN_PLACE: root detached by a hook is still fully sanitized',
+      function (assert) {
+        withFreshPurify(function (purify) {
+          // The walk root itself is exempt: a hook that detaches the
+          // IN_PLACE root does not stop the walk from sanitizing it.
+          var host = document.createElement('div');
+          var root = document.createElement('div');
+          root.innerHTML = '<img onerror="alert(1)"><b>ok</b>';
+          host.appendChild(root);
+
+          purify.addHook('beforeSanitizeElements', function (node) {
+            if (node === root) {
+              detachNode(node);
+            }
+          });
+
+          var ret = purify.sanitize(root, { IN_PLACE: true });
+
+          assert.equal(ret, root, 'returns the same in-place node');
+          assert.equal(root.innerHTML, '<img><b>ok</b>');
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-75838: hook-detached nodes do not change string and DOM sanitization output',
+      function (assert) {
+        detachingHooks.forEach(function (hook) {
+          withFreshPurify(function (purify) {
+            purify.addHook(hook, function (node) {
+              if (node.nodeName === 'SECTION') {
+                detachNode(node);
+              }
+            });
+
+            assert.equal(
+              purify.sanitize(
+                '<section><img src=x onerror=alert(1)></section><p>ok</p>'
+              ),
+              '<p>ok</p>',
+              hook + ': string path drops the hook-detached subtree'
+            );
+
+            var node = document.createElement('div');
+            node.innerHTML =
+              '<section><img onerror=alert(1)></section><p>ok</p>';
+            assert.equal(
+              purify.sanitize(node, { RETURN_DOM: true }).innerHTML,
+              '<div><p>ok</p></div>',
+              hook + ': DOM path drops the hook-detached subtree'
+            );
+          });
+        });
+      }
+    );
+
     QUnit.test('removeHook returns hook function', function (assert) {
       const entryPoint = 'afterSanitizeAttributes';
       const dirty = '<div class="hello"></div>';
