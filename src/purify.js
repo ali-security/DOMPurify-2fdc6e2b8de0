@@ -7,6 +7,7 @@ import {
   create,
   freeze,
   arrayForEach,
+  arrayIndexOf,
   arrayPop,
   arrayPush,
   stringMatch,
@@ -132,6 +133,12 @@ function createDOMPurify(window = getGlobal()) {
   const getNodeName =
     Node && Node.prototype
       ? lookupNodeGetter(Node.prototype, 'nodeName')
+      : null;
+  /* Only cache the shadowRoot getter where the engine implements Shadow DOM,
+     there is no shadow root to sanitize anywhere else */
+  const getShadowRoot =
+    'shadowRoot' in ElementPrototype
+      ? lookupNodeGetter(ElementPrototype, 'shadowRoot')
       : null;
 
   // As per issue #47, the web-components registry is inherited by a
@@ -402,6 +409,9 @@ function createDOMPurify(window = getGlobal()) {
   /* Document namespace */
   let NAMESPACE = HTML_NAMESPACE;
   let IS_EMPTY_INPUT = false;
+
+  /* Attached shadow roots already sanitized by the current sanitize() call */
+  let SANITIZED_SHADOW_ROOTS = [];
 
   /* Allowed XHTML+XML namespaces */
   let ALLOWED_NAMESPACES = null;
@@ -1663,6 +1673,21 @@ function createDOMPurify(window = getGlobal()) {
       if (_isDocumentFragment(shadowNode.content)) {
         _sanitizeShadowDOM(shadowNode.content);
       }
+
+      /* An element iterated here may itself host an attached shadow root.
+         The NodeIterator does not enter shadow trees, so a shadow root
+         nested inside <template>.content was reached by no walk at all (the
+         template-content recursion above iterates the content but never
+         inspected shadowRoot), and its payload survived. Walk it explicitly.
+         The shadowRoot is read through the cached Element.prototype getter,
+         and only for element nodes, as the iterator also surfaces text and
+         comment nodes. CVE-2026-49978. */
+      if (getShadowRoot && _getNodeType(shadowNode) === 1) {
+        const innerShadowRoot = getShadowRoot(shadowNode);
+        if (_isDocumentFragment(innerShadowRoot)) {
+          _sanitizeShadowRoot(innerShadowRoot);
+        }
+      }
     }
 
     /* The per-node strip in _sanitizeElements sees each text node alone, so
@@ -1676,6 +1701,77 @@ function createDOMPurify(window = getGlobal()) {
 
     /* Execute a hook if present */
     _executeHook('afterSanitizeShadowDOM', fragment, null);
+  };
+
+  /**
+   * _sanitizeAttachedShadowRoots
+   *
+   * Walks `root` and feeds every attached shadow root it finds into
+   * _sanitizeShadowDOM. The node iterator does not descend into shadow
+   * trees, so an open shadow root attached to the IN_PLACE root or to any
+   * element below it (or deep-cloned by importNode() for a clonable shadow
+   * root) would otherwise never be sanitized. Runs before the main walk.
+   * Children are snapshotted first, as a hook may detach siblings.
+   * All reads go through the cached prototype getters, so a clobbering form
+   * descendant can not steer the walk. Upstream b4fdfe2e, e4790120.
+   * CVE-2026-49978.
+   *
+   * @param  {Node} root the subtree root to walk for attached shadow roots
+   */
+  const _sanitizeAttachedShadowRoots = function (root) {
+    if (!getShadowRoot) {
+      return;
+    }
+
+    const nodeType = _getNodeType(root);
+    if (nodeType === 1) {
+      const shadowRoot = getShadowRoot(root);
+      if (_isDocumentFragment(shadowRoot)) {
+        _sanitizeShadowRoot(shadowRoot);
+      }
+    } else if (nodeType !== 9 && nodeType !== 11) {
+      return;
+    }
+
+    const childNodes = getChildNodes(root);
+    if (!childNodes) {
+      return;
+    }
+
+    const snapshot = [];
+    arrayForEach(childNodes, (child) => {
+      arrayPush(snapshot, child);
+    });
+    arrayForEach(snapshot, (child) => {
+      _sanitizeAttachedShadowRoots(child);
+    });
+
+    /* A <template> keeps its children in .content */
+    if (nodeType === 1 && _isDocumentFragment(root.content)) {
+      _sanitizeAttachedShadowRoots(root.content);
+    }
+  };
+
+  /**
+   * _sanitizeShadowRoot
+   *
+   * Sanitizes an attached shadow root. Nested shadow roots are walked first,
+   * so that they are reached even if _sanitizeShadowDOM removes their hosts,
+   * then the shadow root itself is sanitized. That walk and the shadowRoot
+   * check in _sanitizeShadowDOM both reach every nested shadow root, so each
+   * one is handled once per sanitize() call. A shadow root nested n levels
+   * deep would otherwise be sanitized 2^n times. CVE-2026-49978.
+   *
+   * @param  {DocumentFragment} shadowRoot the attached shadow root
+   */
+  const _sanitizeShadowRoot = function (shadowRoot) {
+    if (arrayIndexOf(SANITIZED_SHADOW_ROOTS, shadowRoot) !== -1) {
+      return;
+    }
+
+    arrayPush(SANITIZED_SHADOW_ROOTS, shadowRoot);
+    _sanitizeAttachedShadowRoots(shadowRoot);
+    _sanitizeShadowDOM(shadowRoot);
   };
 
   /**
@@ -1761,6 +1857,9 @@ function createDOMPurify(window = getGlobal()) {
     /* Clean up removed elements */
     DOMPurify.removed = [];
 
+    /* Clean up the shadow roots sanitized by a previous call */
+    SANITIZED_SHADOW_ROOTS = [];
+
     /* Check if dirty is correctly typed for IN_PLACE */
     if (typeof dirty === 'string') {
       IN_PLACE = false;
@@ -1798,6 +1897,10 @@ function createDOMPurify(window = getGlobal()) {
           'root node is clobbered and cannot be sanitized in-place'
         );
       }
+
+      /* Sanitize attached shadow roots before the main iterator runs.
+         The iterator does not descend into shadow trees. CVE-2026-49978 */
+      _sanitizeAttachedShadowRoots(dirty);
     } else if (dirty instanceof Node) {
       /* If dirty is a DOM element, append to an empty document to avoid
          elements being stripped by the parser */
@@ -1812,6 +1915,12 @@ function createDOMPurify(window = getGlobal()) {
         // eslint-disable-next-line unicorn/prefer-dom-node-append
         body.appendChild(importedNode);
       }
+
+      /* Clonable shadow roots are deep-cloned by importNode(); sanitize
+         them before the main iterator runs, since the iterator does not
+         descend into shadow trees. Walk from `body`: an imported fragment
+         was emptied into it by the appendChild() above. CVE-2026-49978 */
+      _sanitizeAttachedShadowRoots(body);
     } else {
       /* Exit directly if we have nothing to do */
       if (
@@ -1867,6 +1976,7 @@ function createDOMPurify(window = getGlobal()) {
     }
 
     oldNode = null;
+    SANITIZED_SHADOW_ROOTS = [];
 
     /* If we sanitized `dirty` in-place, return it. */
     if (IN_PLACE) {

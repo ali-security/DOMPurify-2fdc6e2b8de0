@@ -3469,6 +3469,666 @@
       }
     );
 
+    // -----------------------------------------------------------------------
+    // CVE-2026-49978 (GHSA-rp9w-3fw7-7cwq) - attached shadow roots. The
+    // NodeIterator does not enter shadow trees, so an open shadow root
+    // attached to the IN_PLACE root or to any element below it, a clonable
+    // shadow root copied by importNode() for node input, and a shadow root
+    // nested inside <template>.content were reached by no walk at all and
+    // their payload survived. A pre-pass now feeds every attached shadow root
+    // (descending into <template>.content) into _sanitizeShadowDOM, and
+    // _sanitizeShadowDOM walks the shadow root of every element it iterates.
+    // The trees are built in an inert document, so no image request is made.
+    // Engines without attachShadow skip these tests.
+    // -----------------------------------------------------------------------
+    var supportsShadowRoots = function () {
+      var probe = document.createElement('div');
+      try {
+        probe.attachShadow({ mode: 'open' });
+        return true;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    var supportsClonableShadowRoots = function () {
+      var probe = document.createElement('div');
+      try {
+        probe.attachShadow({ mode: 'open', clonable: true });
+      } catch (_) {
+        return false;
+      }
+
+      // Engines predating clonable shadow roots accept the unknown dictionary
+      // member, but do not copy the shadow root when cloning the host
+      return Boolean(probe.cloneNode(true).shadowRoot);
+    };
+
+    // A document without a browsing context never loads images, so a
+    // payload left unsanitized (e.g. the original of an imported node input)
+    // can not fire its onerror handler and leak into the XSS tests
+    var createInertDocument = function () {
+      return document.implementation.createHTMLDocument('');
+    };
+
+    QUnit.test(
+      'CVE-2026-49978: open shadow root of a <span> under the IN_PLACE root is sanitized',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          var root = doc.createElement('div');
+          var span = doc.createElement('span');
+          root.appendChild(span);
+          span.attachShadow({ mode: 'open' }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          var clean = purify.sanitize(root, { IN_PLACE: true });
+
+          assert.equal(clean, root, 'the input node is returned');
+          var img = span.shadowRoot.querySelector('img');
+          assert.ok(img, 'the allowed <img> is kept in the shadow root');
+          assert.equal(
+            img.getAttribute('onerror'),
+            null,
+            'onerror is stripped from the <img> in the shadow root'
+          );
+          assert.equal(
+            span.shadowRoot.innerHTML,
+            '<img src="x">',
+            'the shadow root is sanitized'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: attached shadow roots in the main tree are sanitized in-place',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          var payload =
+            '<img src=x onerror=alert(1)><script>alert(2)</script><b>ok</b>';
+          // Shadow root on a descendant, nested shadow root, shadow root on
+          // the root itself (upstream b4fdfe2e pre-pass)
+          var root = doc.createElement('div');
+          var host = doc.createElement('span');
+          root.appendChild(host);
+          var shadow = host.attachShadow({ mode: 'open' });
+          shadow.innerHTML = payload + '<div></div>';
+          shadow.lastChild.attachShadow({ mode: 'open' }).innerHTML = payload;
+          root.attachShadow({ mode: 'open' }).innerHTML = payload;
+
+          purify.sanitize(root, { IN_PLACE: true });
+
+          var roots = [
+            host.shadowRoot,
+            host.shadowRoot.lastChild.shadowRoot,
+            root.shadowRoot,
+          ];
+          for (var i = 0; i < roots.length; i++) {
+            assert.equal(
+              roots[i].querySelectorAll('script').length,
+              0,
+              'script removed from shadow root ' + i
+            );
+            var img = roots[i].querySelector('img');
+            assert.ok(
+              !img || img.getAttribute('onerror') === null,
+              'onerror stripped in shadow root ' + i
+            );
+            assert.equal(
+              roots[i].querySelectorAll('b').length,
+              1,
+              'allowed content kept in shadow root ' + i
+            );
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: shadow root inside template.content is sanitized in-place',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          var tpl = doc.createElement('template');
+          var host = doc.createElement('div');
+          tpl.content.appendChild(host);
+          host.attachShadow({ mode: 'open' }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(tpl, { IN_PLACE: true });
+
+          // The shadow root's onerror attribute must be stripped.
+          var shadowImg =
+            tpl.content.firstChild &&
+            tpl.content.firstChild.shadowRoot &&
+            tpl.content.firstChild.shadowRoot.querySelector('img');
+          if (shadowImg) {
+            assert.equal(
+              shadowImg.getAttribute('onerror'),
+              null,
+              'onerror inside shadow root inside template.content must be stripped'
+            );
+          } else {
+            // The whole img may have been removed; also acceptable.
+            assert.ok(
+              true,
+              '<img> removed entirely from shadow root inside template.content'
+            );
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: clonable shadow root inside template.content does not survive stamping',
+      function (assert) {
+        if (!supportsClonableShadowRoots()) {
+          assert.ok(
+            true,
+            'SKIP: clonable shadow roots not supported in this engine'
+          );
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          var tpl = doc.createElement('template');
+          var host = doc.createElement('div');
+          tpl.content.appendChild(host);
+          host.attachShadow({ mode: 'open', clonable: true }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(tpl, { IN_PLACE: true });
+
+          // The realistic exploitation path: clone the (now-sanitized)
+          // template content into the live document. The cloned shadow
+          // tree must not carry the onerror.
+          var clone = tpl.content.cloneNode(true);
+          var clonedImg =
+            clone.firstChild &&
+            clone.firstChild.shadowRoot &&
+            clone.firstChild.shadowRoot.querySelector('img');
+          if (clonedImg) {
+            assert.equal(
+              clonedImg.getAttribute('onerror'),
+              null,
+              'onerror inside cloned-stamped shadow root must be stripped'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely after stamping');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: nested templates: outer.content > inner.content > shadow root',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // Two <template> elements nested by content. The innermost
+          // host inside the inner template's content carries the
+          // malicious shadow root. Reaches the host only via repeated
+          // recursion into template.content.
+          var outer = doc.createElement('template');
+          var inner = doc.createElement('template');
+          var host = doc.createElement('div');
+          inner.content.appendChild(host);
+          outer.content.appendChild(inner);
+          host.attachShadow({ mode: 'open' }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(outer, { IN_PLACE: true });
+
+          var sr =
+            outer.content.firstChild &&
+            outer.content.firstChild.content &&
+            outer.content.firstChild.content.firstChild &&
+            outer.content.firstChild.content.firstChild.shadowRoot;
+          var img = sr && sr.querySelector('img');
+          if (img) {
+            assert.equal(
+              img.getAttribute('onerror'),
+              null,
+              'onerror in shadow root inside nested template content must be stripped'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: wrapper element > template > shadow root: walked via descent',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // A regular <div> as the IN_PLACE root, containing a template,
+          // whose content holds a shadow host. The walk must descend
+          // through the wrapper, find the template, recurse into
+          // template.content, and walk the host's shadow root.
+          var root = doc.createElement('div');
+          var tpl = doc.createElement('template');
+          var host = doc.createElement('div');
+          tpl.content.appendChild(host);
+          root.appendChild(tpl);
+          host.attachShadow({ mode: 'open' }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(root, { IN_PLACE: true });
+
+          var sr =
+            root.firstChild &&
+            root.firstChild.content &&
+            root.firstChild.content.firstChild &&
+            root.firstChild.content.firstChild.shadowRoot;
+          var img = sr && sr.querySelector('img');
+          if (img) {
+            assert.equal(
+              img.getAttribute('onerror'),
+              null,
+              'onerror in shadow root inside template inside wrapper must be stripped'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: <template> nested inside a shadow root inside template.content is walked',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // Template.content > host > shadow root > template > img. The
+          // walk alternates between shadow-root descent and
+          // template-content recursion.
+          var outer = doc.createElement('template');
+          var host = doc.createElement('div');
+          outer.content.appendChild(host);
+          var sr = host.attachShadow({ mode: 'open' });
+          var inner = doc.createElement('template');
+          inner.innerHTML = '<img src=x onerror=alert(1)>';
+          sr.appendChild(inner);
+
+          purify.sanitize(outer, { IN_PLACE: true });
+
+          var innerTpl =
+            outer.content.firstChild &&
+            outer.content.firstChild.shadowRoot &&
+            outer.content.firstChild.shadowRoot.querySelector('template');
+          var img = innerTpl && innerTpl.content.querySelector('img');
+          if (img) {
+            assert.equal(
+              img.getAttribute('onerror'),
+              null,
+              'onerror inside <template>.content inside shadow root must be stripped'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: template.content > shadow root > template > shadow root: alternating descent',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // Outer host with shadow root inside template content, whose
+          // shadow contains a <template>, whose content contains an inner
+          // host with its own shadow root carrying the payload.
+          var tpl = doc.createElement('template');
+          var outerHost = doc.createElement('div');
+          tpl.content.appendChild(outerHost);
+          var outerSr = outerHost.attachShadow({ mode: 'open' });
+          var innerTpl = doc.createElement('template');
+          outerSr.appendChild(innerTpl);
+          var innerHost = doc.createElement('div');
+          innerTpl.content.appendChild(innerHost);
+          innerHost.attachShadow({ mode: 'open' }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(tpl, { IN_PLACE: true });
+
+          var outerShadow =
+            tpl.content.firstChild && tpl.content.firstChild.shadowRoot;
+          var innerSr =
+            outerShadow &&
+            outerShadow.firstChild &&
+            outerShadow.firstChild.content &&
+            outerShadow.firstChild.content.firstChild &&
+            outerShadow.firstChild.content.firstChild.shadowRoot;
+          var img = innerSr && innerSr.querySelector('img');
+          if (img) {
+            assert.equal(
+              img.getAttribute('onerror'),
+              null,
+              'onerror in deep shadow > template > shadow chain must be stripped'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: shadow root nested inside a shadow root inside template.content is walked',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // Template.content > host > shadow root > host > shadow root
+          var tpl = doc.createElement('template');
+          var outerHost = doc.createElement('div');
+          tpl.content.appendChild(outerHost);
+          var outerSr = outerHost.attachShadow({ mode: 'open' });
+          outerSr.innerHTML = '<b>ok</b><span></span>';
+          outerSr.lastChild.attachShadow({ mode: 'open' }).innerHTML =
+            '<p>ok</p><img src=x onerror=alert(1)><script>alert(2)</script>';
+
+          purify.sanitize(tpl, { IN_PLACE: true });
+
+          var shadow = tpl.content.firstChild.shadowRoot;
+          assert.equal(
+            shadow.innerHTML,
+            '<b>ok</b><span></span>',
+            'benign content of the outer shadow root is kept'
+          );
+          assert.equal(
+            shadow.lastChild.shadowRoot.innerHTML,
+            '<p>ok</p><img src="x">',
+            'payload of the inner shadow root is sanitized'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: clonable shadow root in nested template survives stamping unscathed',
+      function (assert) {
+        if (!supportsClonableShadowRoots()) {
+          assert.ok(true, 'SKIP: clonable shadow roots not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // End-to-end version of the deeper-nesting case: clonable
+          // shadow root inside nested template content, then stamp the
+          // outer template into the live document. The cloned tree
+          // must not carry the original onerror.
+          var outer = doc.createElement('template');
+          var inner = doc.createElement('template');
+          var host = doc.createElement('div');
+          inner.content.appendChild(host);
+          outer.content.appendChild(inner);
+          host.attachShadow({ mode: 'open', clonable: true }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(outer, { IN_PLACE: true });
+
+          // Stamp the outer template into the live document.
+          var stamped = outer.content.cloneNode(true);
+          var stampedSr =
+            stamped.firstChild &&
+            stamped.firstChild.content &&
+            stamped.firstChild.content.firstChild &&
+            stamped.firstChild.content.firstChild.shadowRoot;
+          var stampedImg = stampedSr && stampedSr.querySelector('img');
+          if (stampedImg) {
+            assert.equal(
+              stampedImg.getAttribute('onerror'),
+              null,
+              'stamped img onerror stripped after deep-nested sanitize'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely after stamping');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: clonable shadow root inside template.content of a node input is sanitized',
+      function (assert) {
+        if (!supportsClonableShadowRoots()) {
+          assert.ok(true, 'SKIP: clonable shadow roots not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // Without IN_PLACE the node is imported (cloned) into the
+          // sanitization document, which copies the clonable shadow root.
+          var root = doc.createElement('div');
+          var tpl = doc.createElement('template');
+          var host = doc.createElement('div');
+          tpl.content.appendChild(host);
+          root.appendChild(tpl);
+          host.attachShadow({ mode: 'open', clonable: true }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          var clean = purify.sanitize(root, { RETURN_DOM: true });
+
+          var cleanTpl = clean.querySelector('template');
+          var sr =
+            cleanTpl &&
+            cleanTpl.content.firstChild &&
+            cleanTpl.content.firstChild.shadowRoot;
+          var img = sr && sr.querySelector('img');
+          if (img) {
+            assert.equal(
+              img.getAttribute('onerror'),
+              null,
+              'onerror in the copied shadow root must be stripped'
+            );
+          } else {
+            assert.ok(true, '<img> removed entirely');
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: clonable shadow root copied by importNode() is sanitized for RETURN_DOM and RETURN_DOM_FRAGMENT',
+      function (assert) {
+        if (!supportsClonableShadowRoots()) {
+          assert.ok(true, 'SKIP: clonable shadow roots not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // Node input without IN_PLACE is deep-cloned by importNode(),
+          // which copies a clonable shadow root along with its host
+          // (upstream b4fdfe2e).
+          var build = function () {
+            var root = doc.createElement('div');
+            var host = doc.createElement('span');
+            root.appendChild(host);
+            host.attachShadow({ mode: 'open', clonable: true }).innerHTML =
+              '<img src=x onerror=alert(1)><script>alert(2)</script>';
+            return root;
+          };
+
+          var configs = [{ RETURN_DOM: true }, { RETURN_DOM_FRAGMENT: true }];
+          for (var i = 0; i < configs.length; i++) {
+            var clean = purify.sanitize(build(), configs[i]);
+            var host = clean.querySelector('span');
+            if (!host || !host.shadowRoot) {
+              assert.ok(true, 'SKIP: importNode() did not copy the shadow root');
+              continue;
+            }
+
+            assert.equal(
+              host.shadowRoot.innerHTML,
+              '<img src="x">',
+              'the copied shadow root is sanitized (' +
+                Object.keys(configs[i])[0] +
+                ')'
+            );
+          }
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: clonable shadow root of a DocumentFragment node input is sanitized',
+      function (assert) {
+        if (!supportsClonableShadowRoots()) {
+          assert.ok(true, 'SKIP: clonable shadow roots not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // The imported fragment is emptied into the sanitization body by
+          // appendChild(), so the walk has to start from the body
+          var fragment = doc.createDocumentFragment();
+          var host = doc.createElement('div');
+          fragment.appendChild(host);
+          host.attachShadow({ mode: 'open', clonable: true }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          var clean = purify.sanitize(fragment, { RETURN_DOM: true });
+
+          var cleanHost = clean.querySelector('div');
+          if (!cleanHost || !cleanHost.shadowRoot) {
+            assert.ok(true, 'SKIP: importNode() did not copy the shadow root');
+            return;
+          }
+
+          assert.equal(
+            cleanHost.shadowRoot.innerHTML,
+            '<img src="x">',
+            'the copied shadow root is sanitized'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: a clobbering form descendant does not hide shadow roots from the walk',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // <input name="childNodes"> shadows form.childNodes, a walk using
+          // direct reads would stop at the form and miss the host below it
+          var root = doc.createElement('div');
+          var form = doc.createElement('form');
+          var input = doc.createElement('input');
+          input.setAttribute('name', 'childNodes');
+          var host = doc.createElement('span');
+          form.appendChild(input);
+          form.appendChild(host);
+          root.appendChild(form);
+          host.attachShadow({ mode: 'open' }).innerHTML =
+            '<img src=x onerror=alert(1)>';
+
+          purify.sanitize(root, { IN_PLACE: true });
+
+          assert.equal(
+            host.shadowRoot.innerHTML,
+            '<img src="x">',
+            'the shadow root below the clobbered form is sanitized'
+          );
+        });
+      }
+    );
+
+    QUnit.test(
+      'CVE-2026-49978: each nested shadow root is sanitized once per call',
+      function (assert) {
+        if (!supportsShadowRoots()) {
+          assert.ok(true, 'SKIP: attachShadow not supported');
+          return;
+        }
+
+        withFreshPurify(function (purify) {
+          var doc = createInertDocument();
+          // The pre-pass and the shadowRoot check in _sanitizeShadowDOM both
+          // reach a nested shadow root. Without deduplication a shadow root
+          // nested n levels deep is sanitized 2^n times.
+          var depth = 16;
+          var root = doc.createElement('div');
+          var parent = root;
+          var innermost = null;
+          for (var i = 0; i < depth; i++) {
+            var host = doc.createElement('div');
+            parent.appendChild(host);
+            innermost = host.attachShadow({ mode: 'open' });
+            parent = innermost;
+          }
+
+          innermost.innerHTML = '<img src=x onerror=alert(1)>';
+
+          var calls = 0;
+          purify.addHook('beforeSanitizeShadowDOM', function () {
+            calls++;
+          });
+          purify.sanitize(root, { IN_PLACE: true });
+
+          assert.equal(calls, depth, 'every shadow root is sanitized once');
+          assert.equal(
+            innermost.innerHTML,
+            '<img src="x">',
+            'the innermost shadow root is sanitized'
+          );
+        });
+      }
+    );
+
     QUnit.test('removeHook returns hook function', function (assert) {
       const entryPoint = 'afterSanitizeAttributes';
       const dirty = '<div class="hello"></div>';
